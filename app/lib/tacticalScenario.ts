@@ -1,0 +1,96 @@
+export type PortPoint = {
+  id: string;
+  name: string;
+  position: [number, number]; // [lat, lng]
+};
+
+export type ShipState = {
+  shipId: string;
+  name: string;
+  position: [number, number]; // [lat, lng]
+  speed: number;
+  heading: number;
+  destination: string;
+  fuel: number;
+  cargo: string;
+  status: "normal" | "warning" | "distress";
+};
+
+export const boundingBox = {
+  north: 30.5,
+  south: 22.0,
+  east: 60.0,
+  west: 47.5,
+} as const;
+
+export const navigableWater: Array<[number, number]> = [
+  [29.8, 48.6],
+  [29.5, 50.0],
+  [28.8, 50.8],
+  [27.8, 52.0],
+  [26.7, 53.5],
+  [26.3, 55.0],
+  [26.65, 56.1],
+  [26.5, 56.4],
+  [26.0, 56.8],
+  [25.5, 57.5],
+  [25.5, 58.5],
+  [25.0, 60.0],
+  [22.0, 60.0],
+  [22.5, 60.0],
+  [23.8, 58.8],
+  [24.5, 57.2],
+  [25.2, 56.5],
+  [26.45, 56.45],
+  [26.3, 55.9],
+  [26.0, 55.5],
+  [25.3, 54.5],
+  [24.8, 53.0],
+  [25.3, 52.0],
+  [26.4, 51.5],
+  [26.5, 50.3],
+  [27.5, 49.8],
+  [28.5, 49.0],
+  [29.5, 48.3],
+  [29.8, 48.6],
+];
+
+export const ports: PortPoint[] = [
+  { id: "KWT-1", name: "Kuwait City", position: [29.48, 48.34] },
+  { id: "BUS-1", name: "Bushehr", position: [28.83, 50.73] },
+  { id: "DMM-1", name: "Dammam", position: [26.56, 50.3] },
+  { id: "BAH-1", name: "Manama", position: [26.5, 50.55] },
+  { id: "DOH-1", name: "Doha", position: [25.46, 51.95] },
+  { id: "AUH-1", name: "Abu Dhabi", position: [25.22, 54.18] },
+  { id: "DXB-1", name: "Jebel Ali", position: [25.5, 54.75] },
+  { id: "BND-1", name: "Bandar Abbas", position: [26.62, 56.11] },
+  { id: "SOH-1", name: "Sohar", position: [24.72, 57.02] },
+  { id: "MCT-1", name: "Muscat", position: [23.92, 58.58] },
+];
+
+export const rocks: Array<{ id: string; name: string; position: [number, number] }> = [
+  { id: "RK-1", name: "Shallow Ridge Alpha", position: [26.2, 55.7] },
+  { id: "RK-2", name: "Karim Reef", position: [25.7, 57.0] },
+  { id: "RK-3", name: "Hormuz Teeth", position: [26.45, 56.25] },
+  { id: "RK-4", name: "Muscat Shelf", position: [24.2, 58.1] },
+  { id: "RK-5", name: "Qatar Shoal", position: [25.9, 52.1] },
+];
+
+export const initialFleet: ShipState[] = [
+  { shipId: "MV-1", name: "Aurora", position: [26.55, 56.2], speed: 14, heading: 105, destination: "MCT-1", fuel: 6800, cargo: "crude oil", status: "normal" },
+  { shipId: "MV-2", name: "Borealis", position: [25.5, 57.2], speed: 19, heading: 270, destination: "DXB-1", fuel: 5400, cargo: "containers", status: "normal" },
+  { shipId: "MV-3", name: "Cygnus", position: [25.7, 53.0], speed: 16, heading: 95, destination: "MCT-1", fuel: 7200, cargo: "LNG", status: "normal" },
+  { shipId: "MV-4", name: "Dragon", position: [26.4, 56.0], speed: 13, heading: 110, destination: "SOH-1", fuel: 5800, cargo: "bulk grain", status: "normal" },
+  { shipId: "MV-5", name: "Emerald", position: [27.5, 51.2], speed: 12, heading: 165, destination: "DOH-1", fuel: 8200, cargo: "crude oil", status: "normal" },
+  { shipId: "MV-6", name: "Falcon", position: [25.4, 54.53], speed: 22, heading: 280, destination: "DOH-1", fuel: 4100, cargo: "containers", status: "normal" },
+  { shipId: "MV-7", name: "Gharial", position: [26.5, 53.5], speed: 14, heading: 270, destination: "KWT-1", fuel: 750, cargo: "crude oil", status: "normal" },
+  { shipId: "MV-8", name: "Halcyon", position: [24.93, 56.94], speed: 19, heading: 250, destination: "DMM-1", fuel: 5200, cargo: "automobiles", status: "normal" },
+  { shipId: "MV-9", name: "Iris", position: [28.2, 50.3], speed: 13, heading: 175, destination: "BAH-1", fuel: 7800, cargo: "crude oil", status: "normal" },
+  { shipId: "MV-10", name: "Jade", position: [25.02, 57.96], speed: 20, heading: 285, destination: "BND-1", fuel: 6300, cargo: "containers", status: "normal" },
+  { shipId: "MV-11", name: "Kite", position: [25.64, 52.18], speed: 18, heading: 95, destination: "MCT-1", fuel: 7600, cargo: "LNG", status: "normal" },
+  { shipId: "MV-12", name: "Lotus", position: [29.1, 48.8], speed: 12, heading: 145, destination: "SOH-1", fuel: 8500, cargo: "crude oil", status: "normal" },
+  { shipId: "MV-13", name: "Mirage", position: [24.6, 57.3], speed: 21, heading: 320, destination: "BAH-1", fuel: 5900, cargo: "containers", status: "normal" },
+  { shipId: "MV-14", name: "Nova", position: [24.12, 58.43], speed: 11, heading: 290, destination: "DOH-1", fuel: 4600, cargo: "bulk cement", status: "normal" },
+  { shipId: "MV-15", name: "Orca", position: [26.34, 55.91], speed: 13, heading: 215, destination: "MCT-1", fuel: 7100, cargo: "crude oil", status: "normal" },
+];
+

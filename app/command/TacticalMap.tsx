@@ -183,23 +183,51 @@ type ShipFix = {
 };
 
 function shipTone(status: string, speedKnots: number) {
-  if (status === "distressed") return { fill: "#ef4444", stroke: "rgba(255,255,255,0.85)" };
+  if (status === "distressed") return { fill: "#b91c1c", stroke: "rgba(255,255,255,0.9)" };
   if (status === "insufficient_fuel" || status === "out_of_fuel")
-    return { fill: "#f97316", stroke: "rgba(255,255,255,0.85)" };
-  if (status === "stranded") return { fill: "#dc2626", stroke: "rgba(255,255,255,0.8)" };
-  if (status === "rerouting") return { fill: "#f59e0b", stroke: "rgba(255,255,255,0.8)" };
-  if (status === "stopped") return { fill: "#64748b", stroke: "rgba(255,255,255,0.55)" };
-  if (speedKnots >= 15) return { fill: "#22c55e", stroke: "rgba(255,255,255,0.8)" };
-  return { fill: "#38bdf8", stroke: "rgba(255,255,255,0.75)" };
+    return { fill: "#ea580c", stroke: "rgba(255,255,255,0.88)" };
+  if (status === "stranded") return { fill: "#7f1d1d", stroke: "rgba(255,255,255,0.85)" };
+  if (status === "rerouting") return { fill: "#f59e0b", stroke: "rgba(255,255,255,0.88)" };
+  if (status === "stopped") return { fill: "#64748b", stroke: "rgba(255,255,255,0.6)" };
+  if (speedKnots >= 15) return { fill: "#f43f5e", stroke: "rgba(255,255,255,0.9)" };
+  return { fill: "#e11d48", stroke: "rgba(255,255,255,0.88)" };
 }
 
+/** Side-profile ship (bow up = north); white details like a bridge chart symbol. */
 function shipMarkerInnerHtml(headingDeg: number, fill: string, stroke: string) {
+  const d = "rgba(255,255,255,0.92)";
   return `
-    <div style="width:34px;height:34px;transform:rotate(${headingDeg}deg);transform-origin:50% 50%;">
-      <svg width="34" height="34" viewBox="0 0 64 64" xmlns="http://www.w3.org/2000/svg">
-        <path d="M32 6 C38 14 43 24 46 36 L52 56 L32 50 L12 56 L18 36 C21 24 26 14 32 6 Z"
-          fill="${fill}" stroke="${stroke}" stroke-width="2.8" stroke-linejoin="round"/>
-        <path d="M32 10 L32 48" stroke="rgba(0,0,0,0.25)" stroke-width="2" stroke-linecap="round"/>
+    <div style="width:36px;height:36px;transform:rotate(${headingDeg}deg);transform-origin:50% 50%;">
+      <svg width="36" height="36" viewBox="0 0 32 40" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
+        <path
+          d="M16 2.8c3.6 2.2 6.4 6.8 7.4 12.2l.8 5.2 1.2 7.4c.3 2.1-.4 4-1.8 5.4-1.5 1.5-3.6 2.2-5.6 2.3h-.2c-2-.1-4.1-.8-5.6-2.3-1.4-1.4-2.1-3.3-1.8-5.4l1.2-7.4.8-5.2C9.6 9.6 12.4 5 16 2.8z"
+          fill="${fill}"
+          stroke="${stroke}"
+          stroke-width="1.1"
+          stroke-linejoin="round"
+        />
+        <path d="M8 30.5h16" stroke="${d}" stroke-width="0.85" stroke-linecap="round" opacity="0.95" />
+        <circle cx="21" cy="20.8" r="1.35" fill="${d}" />
+        <rect x="9" y="16.5" width="11.8" height="6.8" rx="0.65" fill="${fill}" stroke="${d}" stroke-width="0.6" />
+        <rect x="12.4" y="10.5" width="3.6" height="6.8" rx="0.35" fill="${fill}" stroke="${d}" stroke-width="0.55" />
+        <line x1="12.8" y1="12.6" x2="15.5" y2="12.6" stroke="${d}" stroke-width="0.5" stroke-linecap="round" />
+        <rect x="17" y="17.6" width="3.5" height="2.85" fill="none" stroke="${d}" stroke-width="0.48" />
+        <path
+          d="M17.4 18.2l2.1 1.5M17.4 19l1.9 1.35M17.4 19.85l1.7 1.15"
+          stroke="${d}"
+          stroke-width="0.34"
+          stroke-linecap="round"
+        />
+        <rect x="17.3" y="8.4" width="2.6" height="3.9" rx="0.25" fill="${fill}" stroke="${d}" stroke-width="0.45" />
+        <line x1="17.5" y1="9.6" x2="19.6" y2="9.6" stroke="${d}" stroke-width="0.4" />
+        <path
+          d="M7 25.5l1.4-2.3h1.3L7 27.5"
+          fill="none"
+          stroke="${d}"
+          stroke-width="0.55"
+          stroke-linecap="round"
+          stroke-linejoin="round"
+        />
       </svg>
     </div>`;
 }
@@ -224,8 +252,8 @@ function createShipMarkerElement({
   wrap.type = "button";
   wrap.setAttribute("aria-label", `Select ship ${shipId}`);
   wrap.className = "ship-dom-marker";
-  wrap.style.width = "34px";
-  wrap.style.height = "34px";
+  wrap.style.width = "36px";
+  wrap.style.height = "36px";
   wrap.style.background = "transparent";
   wrap.style.border = "none";
   wrap.style.padding = "0";

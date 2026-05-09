@@ -36,7 +36,7 @@ export default function SignupPage() {
         return;
       }
 
-      router.push(role === "captain" ? "/captain" : "/command");
+      router.push(role === "captain" ? "/command-dashboard" : "/command");
     } catch (err) {
       setError(err instanceof Error ? err.message : "Signup failed.");
     } finally {

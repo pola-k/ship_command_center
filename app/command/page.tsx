@@ -1,7 +1,7 @@
 "use client";
 
-import { useEffect, useState } from "react";
 import { useRouter } from "next/navigation";
+import { useEffect, useState } from "react";
 import { resolveUserRole } from "../lib/authRole";
 import { supabase } from "../lib/supabaseClient";
 import TacticalMap from "./TacticalMap";
@@ -44,4 +44,3 @@ export default function CommandPage() {
     </div>
   );
 }
-

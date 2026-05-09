@@ -22,7 +22,7 @@ export default function ChooseRolePage() {
       }
       const existing = await resolveUserRole(supabase, data.user);
       if (existing) {
-        router.replace(existing === "captain" ? "/captain" : "/command");
+        router.replace(existing === "captain" ? "/command-dashboard" : "/command");
         return;
       }
       if (mounted) setRole("captain");
@@ -42,7 +42,7 @@ export default function ChooseRolePage() {
         data: { role },
       });
       if (error) throw error;
-      router.push(role === "captain" ? "/captain" : "/command");
+      router.push(role === "captain" ? "/command-dashboard" : "/command");
     } catch (err) {
       setError(err instanceof Error ? err.message : "Failed to save role.");
     } finally {

@@ -1,7 +1,7 @@
 import { createClient } from "@supabase/supabase-js";
 import { NextResponse } from "next/server";
 
-import { NAVIGABLE_WATER_LATLNG } from "@/lib/fleetConfig";
+import { FUEL_TONS_PER_SIM_STEP, NAVIGABLE_WATER_LATLNG } from "@/lib/fleetConfig";
 import { parsePoint } from "@/lib/geo";
 import { advanceLatLng, mpsFromKnots } from "@/lib/kinematics";
 import { pointInPolygon } from "@/lib/waterRouting";
@@ -61,7 +61,8 @@ export async function POST(req: Request) {
       continue;
     }
 
-    const fuel = Math.max(0, Number(row.fuel_tons) - dt * 0.025);
+    const burn = FUEL_TONS_PER_SIM_STEP;
+    const fuel = Math.max(0, Number(row.fuel_tons) - burn);
 
     const { error: upErr } = await supabase
       .from("ship_state_current")

@@ -3,6 +3,7 @@
 import { AnimatePresence, motion } from "framer-motion";
 import {
   Activity,
+  Bell,
   BrainCircuit,
   ChevronLeft,
   List,
@@ -11,7 +12,10 @@ import {
   X,
 } from "lucide-react";
 import { useEffect, useMemo, useState } from "react";
+import { createCriticalCaptainOrder } from "@/app/lib/directiveOrders";
 import type { ShipIntel } from "@/app/data/ships";
+import { supabase } from "@/lib/supabaseClient";
+import { SendCaptainOrderModal } from "@/components/SendCaptainOrderModal";
 import {
   analyzeShipThreat,
   type DistressLevel,
@@ -22,6 +26,8 @@ type Props = {
   ships: ShipIntel[];
   /** Extra classes on the invisible full-screen hit layer (e.g. z-index). */
   className?: string;
+  /** When set, enables “bridge alert” to ship captains (matches `ships.id` e.g. MV-1). */
+  commandUserId?: string | null;
 };
 
 const distressStyles: Record<
@@ -65,11 +71,17 @@ function RiskBar({ value, accent }: { value: number; accent: string }) {
 }
 
 /** Compact left control + floating card — does not use a full-height sidebar bar. */
-export default function ThreatPanel({ ships, className = "" }: Props) {
+export default function ThreatPanel({
+  ships,
+  className = "",
+  commandUserId = null,
+}: Props) {
   const [scanTick, setScanTick] = useState(0);
   const [clientReady, setClientReady] = useState(false);
   const [panelOpen, setPanelOpen] = useState(false);
   const [selectedShipId, setSelectedShipId] = useState<string | null>(null);
+  const [alertOpen, setAlertOpen] = useState(false);
+  const [alertTarget, setAlertTarget] = useState<ShipIntel | null>(null);
 
   useEffect(() => {
     const t = window.setTimeout(() => setClientReady(true), 0);
@@ -107,6 +119,14 @@ export default function ThreatPanel({ ships, className = "" }: Props) {
   function closePanel() {
     setPanelOpen(false);
     setSelectedShipId(null);
+    setAlertOpen(false);
+    setAlertTarget(null);
+  }
+
+  function openBridgeAlert(ship: ShipIntel) {
+    if (!commandUserId) return;
+    setAlertTarget(ship);
+    setAlertOpen(true);
   }
 
   return (
@@ -174,6 +194,27 @@ export default function ThreatPanel({ ships, className = "" }: Props) {
                   </span>
                   Live AI
                 </div>
+                {commandUserId ? (
+                  <button
+                    type="button"
+                    onClick={() => {
+                      const ship =
+                        selectedRow?.ship ??
+                        rows[0]?.ship ??
+                        null;
+                      if (ship) openBridgeAlert(ship);
+                    }}
+                    title={
+                      selectedRow
+                        ? `Send bridge alert: ${selectedRow.ship.shipName}`
+                        : "Send bridge alert (uses top-risk vessel)"
+                    }
+                    className="inline-flex items-center gap-1 rounded-full border border-amber-400/35 bg-amber-500/15 px-2 py-0.5 text-[9px] font-semibold uppercase tracking-wider text-amber-100 ring-1 ring-amber-400/25 hover:bg-amber-500/25 sm:text-[10px]"
+                  >
+                    <Bell className="h-3 w-3" aria-hidden />
+                    Alert
+                  </button>
+                ) : null}
                 <div className="flex items-center gap-1.5 text-[9px] text-white/40 sm:text-[10px]">
                   <Radio className="h-3 w-3 shrink-0 text-cyan-300/70" />
                   <span suppressHydrationWarning>
@@ -204,6 +245,18 @@ export default function ThreatPanel({ ships, className = "" }: Props) {
                       ship={selectedRow.ship}
                       analysis={selectedRow.analysis}
                     />
+                    {commandUserId ? (
+                      <div className="mt-3">
+                        <button
+                          type="button"
+                          onClick={() => openBridgeAlert(selectedRow.ship)}
+                          className="flex w-full items-center justify-center gap-2 rounded-xl border border-amber-400/40 bg-amber-500/15 py-2.5 text-[11px] font-bold text-amber-100 hover:bg-amber-500/25"
+                        >
+                          <Bell className="h-4 w-4" aria-hidden />
+                          Send bridge alert to captain
+                        </button>
+                      </div>
+                    ) : null}
                   </div>
                 </div>
               ) : (
@@ -215,42 +268,55 @@ export default function ThreatPanel({ ships, className = "" }: Props) {
                   <ul className="flex flex-col gap-1.5 pb-2">
                     {rows.map(({ ship, analysis }) => (
                       <li key={ship.id} className="list-none">
-                        <button
-                          type="button"
-                          onClick={() => setSelectedShipId(ship.id)}
-                          className="group flex w-full items-center gap-3 rounded-xl border border-white/10 bg-white/[0.04] px-3 py-2.5 text-left transition hover:scale-[1.01] hover:border-cyan-400/30 hover:bg-white/[0.07]"
-                        >
-                          <span
-                            className={`h-9 w-1 shrink-0 rounded-full ${
-                              analysis.distressLevel === "CRITICAL"
-                                ? "bg-red-500 shadow-[0_0_10px_rgba(239,68,68,0.6)]"
-                                : analysis.distressLevel === "HIGH"
-                                  ? "bg-orange-500"
-                                  : analysis.distressLevel === "MEDIUM"
-                                    ? "bg-amber-400"
-                                    : "bg-cyan-500/60"
-                            }`}
-                            aria-hidden
-                          />
-                          <div className="min-w-0 flex-1">
-                            <p className="truncate text-sm font-semibold text-white group-hover:text-cyan-100">
-                              {ship.shipName}
-                            </p>
-                            <p className="truncate text-[10px] text-white/40">
-                              {ship.id} · {ship.cargo}
-                            </p>
-                          </div>
-                          <div className="shrink-0 text-right">
+                        <div className="flex items-stretch gap-1.5">
+                          <button
+                            type="button"
+                            onClick={() => setSelectedShipId(ship.id)}
+                            className="group flex min-w-0 flex-1 items-center gap-3 rounded-xl border border-white/10 bg-white/[0.04] px-3 py-2.5 text-left transition hover:scale-[1.01] hover:border-cyan-400/30 hover:bg-white/[0.07]"
+                          >
                             <span
-                              className={`rounded-full px-2 py-0.5 text-[9px] font-bold ring-1 ${distressStyles[analysis.distressLevel].badge}`}
+                              className={`h-9 w-1 shrink-0 rounded-full ${
+                                analysis.distressLevel === "CRITICAL"
+                                  ? "bg-red-500 shadow-[0_0_10px_rgba(239,68,68,0.6)]"
+                                  : analysis.distressLevel === "HIGH"
+                                    ? "bg-orange-500"
+                                    : analysis.distressLevel === "MEDIUM"
+                                      ? "bg-amber-400"
+                                      : "bg-cyan-500/60"
+                              }`}
+                              aria-hidden
+                            />
+                            <div className="min-w-0 flex-1">
+                              <p className="truncate text-sm font-semibold text-white group-hover:text-cyan-100">
+                                {ship.shipName}
+                              </p>
+                              <p className="truncate text-[10px] text-white/40">
+                                {ship.id} · {ship.cargo}
+                              </p>
+                            </div>
+                            <div className="shrink-0 text-right">
+                              <span
+                                className={`rounded-full px-2 py-0.5 text-[9px] font-bold ring-1 ${distressStyles[analysis.distressLevel].badge}`}
+                              >
+                                {distressStyles[analysis.distressLevel].label}
+                              </span>
+                              <p className="mt-1 font-mono text-[11px] text-cyan-200/80">
+                                {analysis.overallRisk}
+                              </p>
+                            </div>
+                          </button>
+                          {commandUserId ? (
+                            <button
+                              type="button"
+                              onClick={() => openBridgeAlert(ship)}
+                              title={`Bridge alert: ${ship.shipName}`}
+                              className="flex w-11 shrink-0 items-center justify-center rounded-xl border border-amber-400/35 bg-amber-500/10 text-amber-200 hover:bg-amber-500/20"
+                              aria-label={`Send bridge alert to ${ship.shipName}`}
                             >
-                              {distressStyles[analysis.distressLevel].label}
-                            </span>
-                            <p className="mt-1 font-mono text-[11px] text-cyan-200/80">
-                              {analysis.overallRisk}
-                            </p>
-                          </div>
-                        </button>
+                              <Bell className="h-4 w-4" />
+                            </button>
+                          ) : null}
+                        </div>
                       </li>
                     ))}
                   </ul>
@@ -258,6 +324,28 @@ export default function ThreatPanel({ ships, className = "" }: Props) {
               )}
             </div>
           </motion.div>
+        ) : null}
+      </AnimatePresence>
+
+      <AnimatePresence>
+        {alertOpen && alertTarget && commandUserId ? (
+          <SendCaptainOrderModal
+            open
+            shipId={alertTarget.id}
+            shipName={alertTarget.shipName}
+            onClose={() => {
+              setAlertOpen(false);
+              setAlertTarget(null);
+            }}
+            onSend={async (title, instruction) => {
+              await createCriticalCaptainOrder(supabase, {
+                shipId: alertTarget.id,
+                title,
+                instruction,
+                createdBy: commandUserId,
+              });
+            }}
+          />
         ) : null}
       </AnimatePresence>
     </div>

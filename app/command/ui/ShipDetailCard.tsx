@@ -30,11 +30,14 @@ export function ShipDetailCard({
   ship,
   onClose,
   showClose = true,
+  commandFooter,
 }: {
   ship: ShipDetail;
   onClose: () => void;
   /** Command can dismiss; captain bridge keeps detail pinned. */
   showClose?: boolean;
+  /** Extra actions for command (e.g. send order to captain). */
+  commandFooter?: React.ReactNode;
 }) {
   const destTitle =
     ship.destination_port_name && ship.destination_port_id
@@ -126,6 +129,12 @@ export function ShipDetailCard({
             {ship.cargo_type ?? "—"}
           </p>
         </div>
+
+        {commandFooter ? (
+          <div className="rounded-xl border border-cyan-400/20 bg-cyan-950/20 px-3 py-3">
+            {commandFooter}
+          </div>
+        ) : null}
       </div>
     </div>
   );

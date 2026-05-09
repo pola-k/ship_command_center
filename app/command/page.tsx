@@ -54,7 +54,10 @@ export default function CommandPage() {
         </div>
       ) : null}
       {!loading && session && !isCaptain ? (
-        <ThreatPanel ships={fleetShipsIntel} />
+        <ThreatPanel
+          ships={fleetShipsIntel}
+          commandUserId={session.userId}
+        />
       ) : null}
       {!loading && session ? (
         <TacticalMap
@@ -68,6 +71,8 @@ export default function CommandPage() {
           captainDisplayName={
             session.role === "captain" ? session.displayName : null
           }
+          commandUserId={session.role === "command" ? session.userId : null}
+          captainUserId={session.role === "captain" ? session.userId : null}
         />
       ) : null}
     </div>

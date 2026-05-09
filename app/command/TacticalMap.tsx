@@ -20,6 +20,13 @@ import maplibregl, { GeoJSONSource, LngLatBoundsLike, Map as MlMap } from "mapli
 import "maplibre-gl/dist/maplibre-gl.css";
 
 import type { AppRole } from "@/app/lib/authRole";
+import { CaptainOrdersPanel } from "@/components/CaptainOrdersPanel";
+import { CommandRejectionInbox } from "@/components/CommandRejectionInbox";
+import { SendCaptainOrderModal } from "@/components/SendCaptainOrderModal";
+import {
+  createCriticalCaptainOrder,
+  isShipCriticallyDistressed,
+} from "@/app/lib/directiveOrders";
 import { AO_BOUNDS, NAVIGABLE_WATER_LATLNG } from "@/lib/fleetConfig";
 import { geographyToMapGeometry, parseLineString, parsePoint } from "@/lib/geo";
 import { supabase } from "@/lib/supabaseClient";
@@ -44,6 +51,9 @@ export type TacticalMapProps = {
   captainShipId?: string | null;
   captainShipName?: string | null;
   captainDisplayName?: string | null;
+  /** Logged-in user id (command) — required to send directives & review refusals. */
+  commandUserId?: string | null;
+  captainUserId?: string | null;
 };
 
 type ShipMetaRow = {
@@ -214,8 +224,11 @@ export default function TacticalMap({
   captainShipId = null,
   captainShipName = null,
   captainDisplayName = null,
+  commandUserId = null,
+  captainUserId = null,
 }: TacticalMapProps) {
   const isCaptain = mode === "captain" && Boolean(captainShipId);
+  const isCommand = mode === "command";
 
   const mapRef = useRef<MlMap | null>(null);
   const mapContainerRef = useRef<HTMLDivElement | null>(null);
@@ -244,6 +257,7 @@ export default function TacticalMap({
   const [selectedShipId, setSelectedShipId] = useState<string | null>(null);
   const [hudPanel, setHudPanel] = useState<HudPanel>(null);
   const [showLegend, setShowLegend] = useState(false);
+  const [sendOrderOpen, setSendOrderOpen] = useState(false);
   const [hoverCard, setHoverCard] = useState<{
     x: number;
     y: number;
@@ -772,6 +786,10 @@ export default function TacticalMap({
       supabase.removeChannel(channel);
     };
   }, [isCaptain, captainShipId]);
+
+  useEffect(() => {
+    if (!selectedShipId) setSendOrderOpen(false);
+  }, [selectedShipId]);
 
   // Realtime alerts list refresh (command only)
   useEffect(() => {
@@ -1401,21 +1419,81 @@ export default function TacticalMap({
       </AnimatePresence>
 
       <AnimatePresence>
-        {selectedShipDetail ? (
+        {selectedShipDetail || (isCaptain && captainShipId) ? (
           <motion.aside
             initial={{ x: 360 }}
             animate={{ x: 0 }}
             exit={{ x: 360 }}
             transition={{ type: "spring", stiffness: 320, damping: 28 }}
-            className="absolute right-0 top-0 z-30 h-full w-[380px] border-l border-white/20 bg-slate-900/40 p-4 backdrop-blur-md"
-          >
-            <ShipDetailCard
-              ship={selectedShipDetail}
-              onClose={() => setSelectedShipId(null)}
-              showClose={!isCaptain}
-              onAcknowledgeAlert={acknowledgeAlert}
-            />
+            className="absolute right-0 top-0 z-30 flex h-full w-[380px] flex-col gap-3 border-l border-white/20 bg-slate-900/40 p-4 backdrop-blur-md">
+            <div className="min-h-0 flex-1 overflow-y-auto">
+              {selectedShipDetail ? (
+                <ShipDetailCard
+                  ship={selectedShipDetail}
+                  onClose={() => setSelectedShipId(null)}
+                  showClose={!isCaptain}
+                  onAcknowledgeAlert={acknowledgeAlert}
+                  commandFooter={
+                    isCommand && commandUserId && selectedShipDetail ? (
+                      isShipCriticallyDistressed(selectedShipDetail.status) ? (
+                        <div className="space-y-2">
+                          <p className="text-[10px] leading-relaxed text-amber-200/90">
+                            Critical distress — transmit a formal order to the master of
+                            this vessel.
+                          </p>
+                          <button
+                            type="button"
+                            onClick={() => setSendOrderOpen(true)}
+                            className="w-full rounded-full bg-amber-500 py-2.5 text-xs font-bold text-[#1a0f00] shadow-[0_8px_24px_rgba(245,158,11,0.35)] hover:bg-amber-400"
+                          >
+                            Send order to captain
+                          </button>
+                        </div>
+                      ) : (
+                        <p className="text-[10px] leading-relaxed text-white/45">
+                          Bridge orders unlock when this ship&apos;s status is{" "}
+                          <span className="text-white/70">distressed</span> (critical).
+                        </p>
+                      )
+                    ) : null
+                  }
+                />
+              ) : isCaptain ? (
+                <div className="rounded-2xl border border-white/10 bg-slate-900/50 px-4 py-6 text-center text-xs text-white/50">
+                  Loading your vessel…
+                </div>
+              ) : null}
+            </div>
+            {isCaptain && captainShipId && captainUserId ? (
+              <CaptainOrdersPanel
+                captainShipId={captainShipId}
+                captainUserId={captainUserId}
+              />
+            ) : null}
           </motion.aside>
+        ) : null}
+      </AnimatePresence>
+
+      {isCommand && commandUserId ? (
+        <CommandRejectionInbox commandUserId={commandUserId} />
+      ) : null}
+
+      <AnimatePresence>
+        {sendOrderOpen && selectedShipDetail && commandUserId ? (
+          <SendCaptainOrderModal
+            open
+            shipId={selectedShipDetail.ship_id}
+            shipName={selectedShipDetail.name}
+            onClose={() => setSendOrderOpen(false)}
+            onSend={async (title, instruction) => {
+              await createCriticalCaptainOrder(supabase, {
+                shipId: selectedShipDetail.ship_id,
+                title,
+                instruction,
+                createdBy: commandUserId,
+              });
+            }}
+          />
         ) : null}
       </AnimatePresence>
 

@@ -8,7 +8,7 @@ import {
   Info,
   Loader2,
   MapPin,
-  Navigation,
+  Ship,
   ShipWheel,
   Trash2,
   Undo2,
@@ -86,6 +86,8 @@ export type TacticalMapProps = {
   captainUserId?: string | null;
   /** Extra controls above Zone Architect (e.g. Threats launcher). */
   leadingRail?: ReactNode;
+  /** Notifies parent (e.g. Threat panel) to reload directive text for NLP scoring. */
+  onCommandDirectiveSent?: () => void;
 };
 
 type ShipMetaRow = {
@@ -297,6 +299,7 @@ export default function TacticalMap({
   commandUserId = null,
   captainUserId = null,
   leadingRail = null,
+  onCommandDirectiveSent,
 }: TacticalMapProps) {
   const isCaptain = mode === "captain" && Boolean(captainShipId);
   const isCommand = mode === "command";
@@ -2165,6 +2168,7 @@ export default function TacticalMap({
                 instruction,
                 createdBy: commandUserId,
               });
+              onCommandDirectiveSent?.();
             }}
           />
         ) : null}
@@ -2217,7 +2221,7 @@ export default function TacticalMap({
 
       <div className="pointer-events-none absolute left-1/2 top-4 z-10 max-w-[min(96vw,520px)] -translate-x-1/2 rounded-full border border-white/15 bg-slate-900/65 px-4 py-2 text-center text-xs text-white/80 backdrop-blur-md">
         <p className="flex flex-wrap items-center justify-center gap-2">
-          <Navigation size={14} className="shrink-0" />
+          <Ship size={14} className="shrink-0" strokeWidth={2} aria-hidden />
           {isCaptain && captainShipId ? (
             <>
               <span className="font-semibold text-cyan-100">

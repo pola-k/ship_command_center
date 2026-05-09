@@ -1,5 +1,7 @@
 import type { SupabaseClient } from "@supabase/supabase-js";
 
+import { analyzeCommandDirectiveText } from "./commandMessageNlp";
+
 export type DirectiveStatus =
   | "pending"
   | "accepted"
@@ -137,6 +139,36 @@ export async function fetchRejectionsPendingCommandReview(
   return filterRefusalsForCommandInbox((res.data ?? []) as DirectiveRow[]);
 }
 
+/**
+ * Most recent directive text per ship (for threat NLP overlay). Any status.
+ */
+export async function fetchLatestDirectiveTextByShipIds(
+  supabase: SupabaseClient,
+  shipIds: string[]
+): Promise<Record<string, { title: string; instruction: string }>> {
+  if (shipIds.length === 0) return {};
+
+  const { data, error } = await supabase
+    .from("directives")
+    .select("ship_id,payload,created_at")
+    .in("ship_id", shipIds)
+    .order("created_at", { ascending: false });
+
+  if (error) throw error;
+
+  const out: Record<string, { title: string; instruction: string }> = {};
+  for (const row of data ?? []) {
+    const sid = row.ship_id as string;
+    if (out[sid]) continue;
+    const p = (row.payload ?? {}) as Record<string, unknown>;
+    const title = typeof p.title === "string" ? p.title : "";
+    const instruction = typeof p.instruction === "string" ? p.instruction : "";
+    if (!title.trim() && !instruction.trim()) continue;
+    out[sid] = { title, instruction };
+  }
+  return out;
+}
+
 export async function createCriticalCaptainOrder(
   supabase: SupabaseClient,
   args: {
@@ -146,11 +178,16 @@ export async function createCriticalCaptainOrder(
     createdBy: string;
   }
 ): Promise<DirectiveRow> {
+  const nlp = analyzeCommandDirectiveText(args.title, args.instruction);
   const payload = {
     ...CRITICAL_PAYLOAD_KEYS,
     title: args.title,
     instruction: args.instruction,
-    severity: "critical",
+    severity: nlp.level.toLowerCase(),
+    nlp_matched_keywords: nlp.keywords,
+    nlp_command_risk: nlp.risk,
+    nlp_summary: nlp.summary,
+    nlp_distress_level: nlp.level,
   };
 
   const { data, error } = await supabase

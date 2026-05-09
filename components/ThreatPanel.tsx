@@ -5,14 +5,17 @@ import {
   Activity,
   Bell,
   BrainCircuit,
-  ChevronLeft,
   List,
   Radio,
+  Ship,
   ShieldAlert,
   X,
 } from "lucide-react";
 import { useEffect, useMemo, useState, type ReactNode } from "react";
-import { createCriticalCaptainOrder } from "@/app/lib/directiveOrders";
+import {
+  createCriticalCaptainOrder,
+  fetchLatestDirectiveTextByShipIds,
+} from "@/app/lib/directiveOrders";
 import type { ShipIntel } from "@/app/data/ships";
 import { supabase } from "@/lib/supabaseClient";
 import { SendCaptainOrderModal } from "@/components/SendCaptainOrderModal";
@@ -21,6 +24,11 @@ import {
   type DistressLevel,
   type ShipThreatAnalysis,
 } from "@/app/lib/analyzeShipThreat";
+
+export type TacticalMapSlotExtras = {
+  /** Call after a command directive is stored so Threat NLP refreshes from Supabase. */
+  onCommandDirectiveSent: () => void;
+};
 
 type Props = {
   ships: ShipIntel[];
@@ -32,7 +40,10 @@ type Props = {
    * When set, the threat launcher is passed here; return your tactical map (or other layout)
    * with `leadingRail={threatLauncher}` so the button aligns with Zone Architect / HUD.
    */
-  renderTacticalMap?: (threatLauncher: ReactNode) => ReactNode;
+  renderTacticalMap?: (
+    threatLauncher: ReactNode,
+    extras: TacticalMapSlotExtras
+  ) => ReactNode;
 };
 
 const distressStyles: Record<
@@ -83,6 +94,10 @@ export default function ThreatPanel({
   renderTacticalMap,
 }: Props) {
   const [scanTick, setScanTick] = useState(0);
+  const [directiveEpoch, setDirectiveEpoch] = useState(0);
+  const [directiveByShip, setDirectiveByShip] = useState<
+    Record<string, { title: string; instruction: string }>
+  >({});
   const [clientReady, setClientReady] = useState(false);
   const [panelOpen, setPanelOpen] = useState(false);
   const [selectedShipId, setSelectedShipId] = useState<string | null>(null);
@@ -101,14 +116,38 @@ export default function ThreatPanel({
     return () => window.clearInterval(id);
   }, []);
 
+  useEffect(() => {
+    if (!commandUserId) {
+      setDirectiveByShip({});
+      return;
+    }
+    let cancelled = false;
+    async function run() {
+      try {
+        const ids = ships.map((s) => s.id);
+        const map = await fetchLatestDirectiveTextByShipIds(supabase, ids);
+        if (!cancelled) setDirectiveByShip(map);
+      } catch {
+        if (!cancelled) setDirectiveByShip({});
+      }
+    }
+    void run();
+    return () => {
+      cancelled = true;
+    };
+  }, [commandUserId, ships, directiveEpoch]);
+
   const rows = useMemo(() => {
     return ships
       .map((ship) => ({
         ship,
-        analysis: analyzeShipThreat(ship),
+        analysis: analyzeShipThreat(
+          ship,
+          directiveByShip[ship.id] ?? null
+        ),
       }))
       .sort((a, b) => b.analysis.overallRisk - a.analysis.overallRisk);
-  }, [ships, scanTick]);
+  }, [ships, scanTick, directiveByShip]);
 
   const selectedRow = useMemo(
     () => rows.find((r) => r.ship.id === selectedShipId) ?? null,
@@ -159,7 +198,9 @@ export default function ThreatPanel({
   return (
     <>
       {renderTacticalMap ? (
-        renderTacticalMap(launcherWrap)
+        renderTacticalMap(launcherWrap, {
+          onCommandDirectiveSent: () => setDirectiveEpoch((n) => n + 1),
+        })
       ) : (
         <div className={`pointer-events-none absolute inset-0 z-[21] ${className}`}>
           <div className="pointer-events-auto absolute left-4 top-1/2 z-[21] -translate-y-[calc(50%+6.75rem)]">
@@ -256,7 +297,11 @@ export default function ThreatPanel({
                       onClick={() => setSelectedShipId(null)}
                       className="inline-flex items-center gap-1.5 rounded-lg px-2 py-1.5 text-[11px] font-semibold text-cyan-200/90 transition hover:bg-white/10 sm:text-xs"
                     >
-                      <ChevronLeft className="h-4 w-4" />
+                      <Ship
+                        className="h-4 w-4 shrink-0 -scale-x-100"
+                        strokeWidth={2}
+                        aria-hidden
+                      />
                       Fleet roster
                     </button>
                   </div>
@@ -364,6 +409,7 @@ export default function ThreatPanel({
                 instruction,
                 createdBy: commandUserId,
               });
+              setDirectiveEpoch((n) => n + 1);
             }}
           />
         ) : null}
@@ -435,11 +481,30 @@ function ThreatShipDetail({
           />
         </div>
 
-        <div className="grid grid-cols-3 gap-2 text-[10px]">
+        <div className="grid grid-cols-2 gap-2 text-[10px] sm:grid-cols-4">
           <Metric label="Weather" value={analysis.weatherRisk} />
           <Metric label="Red zone" value={analysis.redZoneRisk} />
           <Metric label="Fuel" value={analysis.fuelRisk} />
+          <Metric label="Command NLP" value={analysis.commandRisk} />
         </div>
+        {analysis.commandKeywords.length > 0 ? (
+          <div className="mt-2 rounded-xl border border-amber-400/20 bg-amber-950/20 px-2.5 py-2">
+            <p className="text-[10px] font-semibold uppercase tracking-wide text-amber-200/70">
+              Latest directive keywords
+            </p>
+            <p className="mt-1 text-[10px] text-amber-100/80">{analysis.commandSummary}</p>
+            <div className="mt-1.5 flex flex-wrap gap-1">
+              {analysis.commandKeywords.map((k) => (
+                <span
+                  key={k}
+                  className="rounded-md bg-black/35 px-1.5 py-0.5 font-mono text-[9px] text-amber-100/90 ring-1 ring-amber-400/25"
+                >
+                  {k}
+                </span>
+              ))}
+            </div>
+          </div>
+        ) : null}
       </div>
 
       <div className="mt-3 rounded-xl border border-white/10 bg-black/25 px-2.5 py-2">

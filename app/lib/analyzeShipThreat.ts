@@ -1,6 +1,17 @@
 import type { ShipIntel } from "../data/ships";
+import {
+  analyzeCommandDirectiveText,
+  distressRank,
+  maxDistress,
+  type CommandNlpDistress,
+} from "./commandMessageNlp";
 
 export type DistressLevel = "LOW" | "MEDIUM" | "HIGH" | "CRITICAL";
+
+export type LatestDirectiveText = {
+  title: string;
+  instruction: string;
+};
 
 export type ShipThreatAnalysis = {
   extractedIssue: string;
@@ -9,8 +20,11 @@ export type ShipThreatAnalysis = {
   weatherRisk: number;
   redZoneRisk: number;
   fuelRisk: number;
+  commandRisk: number;
   overallRisk: number;
   recommendation: string;
+  commandKeywords: string[];
+  commandSummary: string;
 };
 
 function clamp100(n: number) {
@@ -110,16 +124,55 @@ function recommendationFor(
 
 /**
  * Rule-based “AI” threat scoring for one ship intelligence record.
+ * Optional latest command directive text is scored with keyword NLP and merged
+ * into distress level and risk (higher of captain-message vs command hints wins).
  */
-export function analyzeShipThreat(ship: ShipIntel): ShipThreatAnalysis {
-  const { level, extractedIssue, messageRisk } = messageDistress(
-    ship.captainMessage
-  );
+export function analyzeShipThreat(
+  ship: ShipIntel,
+  latestDirective?: LatestDirectiveText | null
+): ShipThreatAnalysis {
+  const { level: capLevel, extractedIssue: capIssue, messageRisk } =
+    messageDistress(ship.captainMessage);
+
+  let commandRisk = 0;
+  let commandKeywords: string[] = [];
+  let commandSummary = "";
+  let cmdNlpLevel: CommandNlpDistress = "LOW";
+
+  const hasDirective =
+    latestDirective &&
+    (latestDirective.title.trim() || latestDirective.instruction.trim());
+
+  if (hasDirective) {
+    const nlp = analyzeCommandDirectiveText(
+      latestDirective.title,
+      latestDirective.instruction
+    );
+    commandRisk = nlp.risk;
+    commandKeywords = nlp.keywords;
+    commandSummary = nlp.summary;
+    cmdNlpLevel = nlp.level;
+  }
+
+  const level = maxDistress(
+    capLevel as CommandNlpDistress,
+    cmdNlpLevel
+  ) as DistressLevel;
+
+  let extractedIssue = capIssue;
+  if (commandKeywords.length > 0) {
+    if (distressRank(cmdNlpLevel) > distressRank(capLevel as CommandNlpDistress)) {
+      extractedIssue = `${commandSummary} (command language dominates captain feed: ${capIssue})`;
+    } else {
+      extractedIssue = `${capIssue} · ${commandSummary}`;
+    }
+  }
+
   const weatherRisk = weatherRiskPoints(ship.weatherCondition);
   const redZoneRisk = redZonePoints(ship.nearRedZone);
   const fuelRisk = fuelRiskPoints(ship.fuelLevel);
 
-  const raw = messageRisk + weatherRisk + redZoneRisk + fuelRisk;
+  const raw = messageRisk + weatherRisk + redZoneRisk + fuelRisk + commandRisk;
   const overallRisk = clamp100(raw);
   const severityScore = overallRisk;
 
@@ -130,7 +183,10 @@ export function analyzeShipThreat(ship: ShipIntel): ShipThreatAnalysis {
     weatherRisk,
     redZoneRisk,
     fuelRisk,
+    commandRisk,
     overallRisk,
+    commandKeywords,
+    commandSummary,
     recommendation: recommendationFor(level, ship.nearRedZone, ship.fuelLevel),
   };
 }

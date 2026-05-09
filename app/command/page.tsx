@@ -41,25 +41,19 @@ export default function CommandPage() {
   }
 
   return (
-    <div className="min-h-dvh bg-[#04131f] px-4 py-4 text-white sm:px-6">
-      <div className="mx-auto w-full max-w-[1500px]">
-        <div className="mb-4 flex items-center justify-between gap-4 rounded-2xl border border-white/10 bg-white/5 px-4 py-3 backdrop-blur">
-          <div>
-            <h1 className="text-lg font-semibold tracking-wide">Command Dashboard</h1>
-            <p className="text-xs text-white/70">
-              Signed in as <span className="font-medium text-white">{email ?? "—"}</span>
-            </p>
-          </div>
-          <button
-            onClick={logout}
-            disabled={loading}
-            className="btn-glow rounded-xl border border-white/20 bg-white/10 px-4 py-2 text-sm font-medium hover:bg-white/15 disabled:cursor-not-allowed disabled:opacity-70"
-          >
-            Log out
-          </button>
-        </div>
-        <TacticalMap />
+    <div className="relative min-h-dvh w-screen overflow-hidden bg-[#04131f] text-white">
+      <div className="absolute right-4 top-4 z-40 rounded-full border border-white/15 bg-slate-900/65 px-3 py-1.5 text-xs backdrop-blur-md">
+        <span className="text-white/80">Signed in:</span>{" "}
+        <span className="font-semibold text-white">{email ?? "—"}</span>
       </div>
+      <button
+        onClick={logout}
+        disabled={loading}
+        className="btn-glow absolute right-4 top-14 z-40 rounded-xl border border-white/20 bg-slate-900/70 px-3 py-1.5 text-xs font-medium backdrop-blur-md hover:bg-slate-800/80 disabled:cursor-not-allowed disabled:opacity-70"
+      >
+        Log out
+      </button>
+      <TacticalMap />
     </div>
   );
 }

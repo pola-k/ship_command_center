@@ -1,7 +1,17 @@
 "use client";
 
+import { AnimatePresence, motion } from "framer-motion";
+import {
+  AlertTriangle,
+  Info,
+  MapPin,
+  Navigation,
+  ShipWheel,
+  Waves,
+  X,
+} from "lucide-react";
 import { useEffect, useMemo, useRef, useState } from "react";
-import maplibregl, { GeoJSONSource, LngLatBoundsLike, Map } from "maplibre-gl";
+import maplibregl, { GeoJSONSource, LngLatBoundsLike, Map as MlMap } from "maplibre-gl";
 import "maplibre-gl/dist/maplibre-gl.css";
 import {
   boundingBox,
@@ -11,6 +21,8 @@ import {
   rocks,
   ShipState,
 } from "../lib/tacticalScenario";
+
+type HudPanel = "fleet" | "alerts" | "ports" | null;
 
 type AlertItem = {
   shipId: string;
@@ -90,17 +102,33 @@ function fleetToGeoJson(fleet: ShipState[]): GeoJSON.FeatureCollection<GeoJSON.P
   };
 }
 
+function computeStatus(ship: ShipState, nearHazardKm: number): ShipState["status"] {
+  if (ship.fuel < 1000 || nearHazardKm <= 2) return "distress";
+  if (nearHazardKm <= 8 || ship.fuel < 2000) return "warning";
+  return "normal";
+}
+
 const bounds: LngLatBoundsLike = [
   [boundingBox.west, boundingBox.south],
   [boundingBox.east, boundingBox.north],
 ];
 
 export default function TacticalMap() {
-  const mapRef = useRef<Map | null>(null);
+  const mapRef = useRef<MlMap | null>(null);
   const mapContainerRef = useRef<HTMLDivElement | null>(null);
   const [fleet, setFleet] = useState<ShipState[]>(initialFleet);
   const fleetRef = useRef<ShipState[]>(initialFleet);
-  const [selectedShipId, setSelectedShipId] = useState<string>(initialFleet[0].shipId);
+  const [selectedShipId, setSelectedShipId] = useState<string | null>(null);
+  const [hudPanel, setHudPanel] = useState<HudPanel>(null);
+  const [showLegend, setShowLegend] = useState(false);
+  const [hoverCard, setHoverCard] = useState<{
+    x: number;
+    y: number;
+    shipId: string;
+    speed: number;
+    status: ShipState["status"];
+  } | null>(null);
+  const pulsePhaseRef = useRef(0);
 
   const selectedShip = useMemo(
     () => fleet.find((ship) => ship.shipId === selectedShipId) ?? null,
@@ -126,6 +154,39 @@ export default function TacticalMap() {
     return nextAlerts.slice(0, 8);
   }, [fleet]);
 
+  const distressShipIds = useMemo(() => {
+    const ids = new Set<string>();
+    for (const alert of alerts) {
+      if (alert.distanceKm <= 2) ids.add(alert.shipId);
+    }
+    for (const ship of fleet) {
+      if (ship.fuel < 1000) ids.add(ship.shipId);
+    }
+    return ids;
+  }, [alerts, fleet]);
+
+  const fleetStatusCounts = useMemo(() => {
+    let normal = 0;
+    let warning = 0;
+    let distress = 0;
+    for (const ship of fleet) {
+      const nearest = rocks
+        .map((rock) => haversineKm(ship.position, rock.position))
+        .sort((a, b) => a - b)[0];
+      const status = computeStatus(ship, nearest ?? 999);
+      if (status === "normal") normal += 1;
+      if (status === "warning") warning += 1;
+      if (status === "distress") distress += 1;
+    }
+    return { normal, warning, distress };
+  }, [fleet]);
+
+  const portById = useMemo(() => {
+    const m = new Map<string, (typeof ports)[number]>();
+    for (const port of ports) m.set(port.id, port);
+    return m;
+  }, []);
+
   useEffect(() => {
     fleetRef.current = fleet;
   }, [fleet]);
@@ -138,7 +199,7 @@ export default function TacticalMap() {
       style: {
         version: 8,
         sources: {},
-        layers: [{ id: "bg", type: "background", paint: { "background-color": "#031b28" } }],
+        layers: [{ id: "bg", type: "background", paint: { "background-color": "#2d4a2f" } }],
       },
       center: [54.5, 26.2],
       zoom: 5.6,
@@ -152,6 +213,55 @@ export default function TacticalMap() {
     mapRef.current = map;
 
     map.on("load", () => {
+      const waterCoords = navigableWater.map(([lat, lng]) => [lng, lat]);
+
+      const hatchFeatures: GeoJSON.Feature<GeoJSON.LineString>[] = [];
+      const step = 0.7;
+      for (let lat = boundingBox.south - 1; lat <= boundingBox.north + 1; lat += step) {
+        hatchFeatures.push({
+          type: "Feature",
+          properties: {},
+          geometry: {
+            type: "LineString",
+            coordinates: [
+              [boundingBox.west - 1, lat],
+              [boundingBox.east + 1, lat + 1.1],
+            ],
+          },
+        });
+      }
+      for (let lng = boundingBox.west - 1; lng <= boundingBox.east + 1; lng += step * 1.5) {
+        hatchFeatures.push({
+          type: "Feature",
+          properties: {},
+          geometry: {
+            type: "LineString",
+            coordinates: [
+              [lng, boundingBox.south - 1],
+              [lng + 1.1, boundingBox.north + 1],
+            ],
+          },
+        });
+      }
+
+      map.addSource("land-hatch", {
+        type: "geojson",
+        data: {
+          type: "FeatureCollection",
+          features: hatchFeatures,
+        },
+      });
+      map.addLayer({
+        id: "land-hatch",
+        type: "line",
+        source: "land-hatch",
+        paint: {
+          "line-color": "#486a41",
+          "line-opacity": 0.22,
+          "line-width": 1,
+        },
+      });
+
       map.addSource("water", {
         type: "geojson",
         data: {
@@ -159,7 +269,7 @@ export default function TacticalMap() {
           properties: {},
           geometry: {
             type: "Polygon",
-            coordinates: [navigableWater.map(([lat, lng]) => [lng, lat])],
+            coordinates: [waterCoords],
           },
         },
       });
@@ -168,8 +278,17 @@ export default function TacticalMap() {
         type: "fill",
         source: "water",
         paint: {
-          "fill-color": "#0c3b56",
-          "fill-opacity": 0.48,
+          "fill-color": "#1a365d",
+          "fill-opacity": 0.78,
+        },
+      });
+      map.addLayer({
+        id: "water-depth",
+        type: "fill",
+        source: "water",
+        paint: {
+          "fill-color": "#1d4b73",
+          "fill-opacity": 0.24,
         },
       });
       map.addLayer({
@@ -230,6 +349,18 @@ export default function TacticalMap() {
         },
       });
       map.addLayer({
+        id: "rocks-ring",
+        type: "circle",
+        source: "rocks",
+        paint: {
+          "circle-color": "#ef4444",
+          "circle-opacity": 0.12,
+          "circle-radius": 11,
+          "circle-stroke-color": "#fca5a5",
+          "circle-stroke-width": 1.2,
+        },
+      });
+      map.addLayer({
         id: "rocks",
         type: "symbol",
         source: "rocks",
@@ -253,6 +384,25 @@ export default function TacticalMap() {
           "circle-stroke-color": "#7dd3fc",
         },
       });
+      map.addSource("ship-pulse", {
+        type: "geojson",
+        data: {
+          type: "FeatureCollection",
+          features: [],
+        },
+      });
+      map.addLayer({
+        id: "ship-pulse-ring",
+        type: "circle",
+        source: "ship-pulse",
+        paint: {
+          "circle-color": "#ef4444",
+          "circle-opacity": 0.35,
+          "circle-radius": 13,
+          "circle-stroke-color": "#f87171",
+          "circle-stroke-width": 1,
+        },
+      });
       map.addLayer({
         id: "ship-heading",
         type: "symbol",
@@ -266,15 +416,47 @@ export default function TacticalMap() {
         paint: { "text-color": "#e2e8f0" },
       });
 
+      map.addSource("selected-route", {
+        type: "geojson",
+        data: {
+          type: "FeatureCollection",
+          features: [],
+        },
+      });
+      map.addLayer({
+        id: "selected-route-line",
+        type: "line",
+        source: "selected-route",
+        paint: {
+          "line-color": "#93c5fd",
+          "line-opacity": 0.9,
+          "line-dasharray": [2, 2],
+          "line-width": 2,
+        },
+      });
+
       map.on("click", "ship-heading", (e) => {
         const shipId = e.features?.[0]?.properties?.shipId as string | undefined;
         if (shipId) setSelectedShipId(shipId);
+      });
+      map.on("mousemove", "ship-heading", (e) => {
+        const feature = e.features?.[0];
+        if (!feature?.properties) return;
+        const p = feature.properties as { shipId: string; speed: number; status: ShipState["status"] };
+        setHoverCard({
+          x: e.point.x,
+          y: e.point.y,
+          shipId: p.shipId,
+          speed: Number(p.speed),
+          status: p.status,
+        });
       });
       map.on("mouseenter", "ship-heading", () => {
         map.getCanvas().style.cursor = "pointer";
       });
       map.on("mouseleave", "ship-heading", () => {
         map.getCanvas().style.cursor = "";
+        setHoverCard(null);
       });
     });
 
@@ -292,73 +474,290 @@ export default function TacticalMap() {
       const dt = Math.min(0.2, (now - last) / 1000);
       last = now;
 
-      const nextFleet = fleetRef.current.map((ship) => advanceShip(ship, dt));
+      const nextFleet = fleetRef.current.map((ship) => {
+        const moved = advanceShip(ship, dt);
+        const nearest = rocks
+          .map((rock) => haversineKm(moved.position, rock.position))
+          .sort((a, b) => a - b)[0];
+        return { ...moved, status: computeStatus(moved, nearest ?? 999) };
+      });
       fleetRef.current = nextFleet;
       setFleet(nextFleet);
 
       const source = mapRef.current?.getSource("ships") as GeoJSONSource | undefined;
       if (source) source.setData(fleetToGeoJson(nextFleet));
 
+      const pulseSource = mapRef.current?.getSource("ship-pulse") as GeoJSONSource | undefined;
+      if (pulseSource) {
+        pulseSource.setData({
+          type: "FeatureCollection",
+          features: nextFleet
+            .filter((ship) => distressShipIds.has(ship.shipId))
+            .map((ship) => ({
+              type: "Feature" as const,
+              properties: {},
+              geometry: {
+                type: "Point" as const,
+                coordinates: [ship.position[1], ship.position[0]],
+              },
+            })),
+        });
+      }
+      if (mapRef.current?.getLayer("ship-pulse-ring")) {
+        pulsePhaseRef.current += dt * 2.8;
+        const wave = 10 + (Math.sin(pulsePhaseRef.current) + 1) * 4;
+        const op = 0.18 + (Math.sin(pulsePhaseRef.current) + 1) * 0.15;
+        mapRef.current.setPaintProperty("ship-pulse-ring", "circle-radius", wave);
+        mapRef.current.setPaintProperty("ship-pulse-ring", "circle-opacity", op);
+      }
+
       raf = requestAnimationFrame(tick);
     };
 
     raf = requestAnimationFrame(tick);
     return () => cancelAnimationFrame(raf);
-  }, []);
+  }, [distressShipIds]);
+
+  useEffect(() => {
+    const map = mapRef.current;
+    if (!map?.isStyleLoaded()) return;
+
+    const routeSource = map.getSource("selected-route") as GeoJSONSource | undefined;
+    if (!routeSource) return;
+
+    if (!selectedShip) {
+      routeSource.setData({ type: "FeatureCollection", features: [] });
+      map.easeTo({ padding: { left: 0, right: 0, top: 0, bottom: 0 }, duration: 350 });
+      return;
+    }
+
+    const destinationPort = portById.get(selectedShip.destination);
+    if (!destinationPort) return;
+
+    routeSource.setData({
+      type: "FeatureCollection",
+      features: [
+        {
+          type: "Feature",
+          properties: {},
+          geometry: {
+            type: "LineString",
+            coordinates: [
+              [selectedShip.position[1], selectedShip.position[0]],
+              [destinationPort.position[1], destinationPort.position[0]],
+            ],
+          },
+        },
+      ],
+    });
+    map.easeTo({
+      center: [selectedShip.position[1], selectedShip.position[0]],
+      duration: 420,
+      padding: { left: 90, right: 350, top: 90, bottom: 90 },
+    });
+  }, [selectedShip, portById]);
+
+  function statusTone(status: ShipState["status"]) {
+    if (status === "distress") return "text-red-200 border-red-400/40 bg-red-500/15";
+    if (status === "warning") return "text-amber-100 border-amber-400/40 bg-amber-500/15";
+    return "text-cyan-100 border-cyan-400/30 bg-cyan-500/10";
+  }
 
   return (
-    <div className="grid h-[calc(100vh-7rem)] grid-cols-1 gap-4 lg:grid-cols-[280px_minmax(0,1fr)_330px]">
-      <aside className="glass-surface rounded-2xl p-4">
-        <h2 className="text-sm font-semibold tracking-wide text-white">Fleet Summary</h2>
-        <div className="mt-3 space-y-2">
-          <div className="rounded-xl border border-white/10 bg-white/5 px-3 py-2 text-xs text-white/70">
-            Active Ships: <span className="font-semibold text-white">{fleet.length}</span>
-          </div>
-          <div className="rounded-xl border border-white/10 bg-white/5 px-3 py-2 text-xs text-white/70">
-            Ports Tracked: <span className="font-semibold text-white">{ports.length}</span>
-          </div>
-          <div className="rounded-xl border border-white/10 bg-white/5 px-3 py-2 text-xs text-white/70">
-            Hazard Nodes: <span className="font-semibold text-white">{rocks.length}</span>
-          </div>
-        </div>
-      </aside>
+    <div className="relative h-screen w-screen overflow-hidden bg-[#183824]">
+      <div ref={mapContainerRef} className="h-full w-full" />
 
-      <section className="relative overflow-hidden rounded-2xl border border-white/10">
-        <div ref={mapContainerRef} className="h-full w-full" />
-      </section>
+      <div
+        className="pointer-events-none absolute inset-0"
+        style={{
+          background:
+            "radial-gradient(80% 70% at 50% 50%, rgba(255,255,255,0) 0%, rgba(0,0,0,0.22) 58%, rgba(0,0,0,0.55) 100%)",
+        }}
+      />
 
-      <aside className="glass-surface rounded-2xl p-4">
-        <h2 className="text-sm font-semibold tracking-wide text-white">Ship Detail</h2>
-        {selectedShip ? (
-          <div className="mt-3 space-y-2 text-xs text-white/75">
-            <p className="text-base font-semibold text-white">{selectedShip.name}</p>
-            <p>Ship ID: {selectedShip.shipId}</p>
-            <p>Destination: {selectedShip.destination}</p>
-            <p>Cargo: {selectedShip.cargo}</p>
-            <p>Speed: {selectedShip.speed} knots</p>
-            <p>Heading: {Math.round(selectedShip.heading)}°</p>
-            <p>Fuel: {Math.round(selectedShip.fuel)} tons</p>
-          </div>
-        ) : (
-          <p className="mt-3 text-xs text-white/60">Select a ship from the map.</p>
-        )}
+      <div className="absolute left-4 top-1/2 z-20 -translate-y-1/2 space-y-3">
+        {[
+          { key: "fleet" as const, label: "Fleet", icon: ShipWheel },
+          { key: "alerts" as const, label: "Alerts", icon: AlertTriangle },
+          { key: "ports" as const, label: "Ports", icon: MapPin },
+        ].map((item) => (
+          <button
+            key={item.key}
+            onClick={() => setHudPanel((prev) => (prev === item.key ? null : item.key))}
+            className="btn-glow flex h-11 w-11 cursor-pointer items-center justify-center rounded-full border border-white/20 bg-slate-900/70 text-cyan-100 backdrop-blur-md transition hover:bg-slate-800/75"
+            aria-label={`${item.label} panel`}
+          >
+            <item.icon size={17} />
+          </button>
+        ))}
+      </div>
 
-        <h3 className="mt-6 text-sm font-semibold tracking-wide text-white">Proximity Alerts</h3>
-        <div className="mt-2 space-y-2">
-          {alerts.length === 0 ? (
-            <p className="text-xs text-emerald-300/90">No immediate hazard warnings.</p>
-          ) : (
-            alerts.map((alert) => (
-              <div
-                key={`${alert.shipId}-${alert.rockName}`}
-                className="rounded-xl border border-red-400/30 bg-red-500/10 px-3 py-2 text-xs text-red-100"
-              >
-                {alert.shipName} near {alert.rockName} ({alert.distanceKm} km)
+      <AnimatePresence>
+        {hudPanel ? (
+          <motion.div
+            initial={{ opacity: 0, x: -12 }}
+            animate={{ opacity: 1, x: 0 }}
+            exit={{ opacity: 0, x: -12 }}
+            className="absolute left-20 top-1/2 z-30 w-[290px] -translate-y-1/2 rounded-2xl border border-white/20 bg-slate-900/60 p-4 text-sm text-white shadow-2xl backdrop-blur-md"
+          >
+            <div className="mb-3 flex items-center justify-between">
+              <p className="text-sm font-semibold tracking-wide">
+                {hudPanel === "fleet" && "Fleet Statistics"}
+                {hudPanel === "alerts" && "Live Alerts"}
+                {hudPanel === "ports" && "Port Directory"}
+              </p>
+              <button onClick={() => setHudPanel(null)} className="rounded-md p-1 hover:bg-white/10">
+                <X size={15} />
+              </button>
+            </div>
+
+            {hudPanel === "fleet" ? (
+              <div className="space-y-2 text-xs">
+                <div className="rounded-xl border border-white/15 bg-white/5 px-3 py-2">
+                  Active Ships: <span className="font-semibold">{fleet.length}</span>
+                </div>
+                <div className="rounded-xl border border-emerald-400/30 bg-emerald-500/10 px-3 py-2">
+                  Normal: <span className="font-semibold">{fleetStatusCounts.normal}</span>
+                </div>
+                <div className="rounded-xl border border-amber-400/30 bg-amber-500/10 px-3 py-2">
+                  Warning: <span className="font-semibold">{fleetStatusCounts.warning}</span>
+                </div>
+                <div className="rounded-xl border border-red-400/35 bg-red-500/10 px-3 py-2">
+                  Distress: <span className="font-semibold">{fleetStatusCounts.distress}</span>
+                </div>
               </div>
-            ))
-          )}
-        </div>
-      </aside>
+            ) : null}
+
+            {hudPanel === "alerts" ? (
+              <div className="space-y-2 text-xs">
+                {alerts.length === 0 ? (
+                  <p className="rounded-xl border border-emerald-300/30 bg-emerald-500/10 px-3 py-2 text-emerald-100">
+                    No active geofence/proximity warnings.
+                  </p>
+                ) : (
+                  alerts.map((alert) => (
+                    <div
+                      key={`${alert.shipId}-${alert.rockName}`}
+                      className="rounded-xl border border-red-400/30 bg-red-500/10 px-3 py-2 text-red-100"
+                    >
+                      {alert.shipName} near {alert.rockName} ({alert.distanceKm} km)
+                    </div>
+                  ))
+                )}
+              </div>
+            ) : null}
+
+            {hudPanel === "ports" ? (
+              <div className="max-h-80 space-y-2 overflow-auto pr-1 text-xs">
+                {ports.map((port) => (
+                  <div key={port.id} className="rounded-xl border border-white/15 bg-white/5 px-3 py-2">
+                    <p className="font-semibold text-white">{port.name}</p>
+                    <p className="text-white/70">{port.id}</p>
+                    <p className="text-white/70">
+                      [{port.position[0].toFixed(2)}, {port.position[1].toFixed(2)}]
+                    </p>
+                  </div>
+                ))}
+              </div>
+            ) : null}
+          </motion.div>
+        ) : null}
+      </AnimatePresence>
+
+      <AnimatePresence>
+        {hoverCard ? (
+          <motion.div
+            initial={{ opacity: 0, scale: 0.96 }}
+            animate={{ opacity: 1, scale: 1 }}
+            exit={{ opacity: 0, scale: 0.96 }}
+            className="pointer-events-none absolute z-40 rounded-xl border border-white/20 bg-slate-900/75 px-3 py-2 text-xs text-white backdrop-blur-md"
+            style={{
+              left: hoverCard.x + 16,
+              top: hoverCard.y + 16,
+            }}
+          >
+            <p className="font-semibold">{hoverCard.shipId}</p>
+            <p>Speed: {Math.round(hoverCard.speed)} kn</p>
+            <p>Status: {hoverCard.status}</p>
+          </motion.div>
+        ) : null}
+      </AnimatePresence>
+
+      <AnimatePresence>
+        {selectedShip ? (
+          <motion.aside
+            initial={{ x: 360 }}
+            animate={{ x: 0 }}
+            exit={{ x: 360 }}
+            transition={{ type: "spring", stiffness: 320, damping: 28 }}
+            className="absolute right-0 top-0 z-30 h-full w-[340px] border-l border-white/20 bg-slate-900/65 p-4 text-white backdrop-blur-md"
+          >
+            <div className="mb-4 flex items-center justify-between">
+              <h2 className="text-sm font-semibold tracking-wide">Ship Detail</h2>
+              <button
+                onClick={() => setSelectedShipId(null)}
+                className="rounded-md p-1 hover:bg-white/10"
+              >
+                <X size={15} />
+              </button>
+            </div>
+            <div className="space-y-2 text-sm text-white/85">
+              <p className="text-lg font-semibold text-white">{selectedShip.name}</p>
+              <p>Ship ID: {selectedShip.shipId}</p>
+              <p>Cargo: {selectedShip.cargo}</p>
+              <p>Fuel: {Math.round(selectedShip.fuel)} tons</p>
+              <p>Destination: {selectedShip.destination}</p>
+              <p>Speed: {selectedShip.speed} knots</p>
+              <p>Heading: {Math.round(selectedShip.heading)}°</p>
+              <div className={`mt-3 rounded-xl border px-3 py-2 text-xs ${statusTone(selectedShip.status)}`}>
+                Operational Status: {selectedShip.status.toUpperCase()}
+              </div>
+            </div>
+          </motion.aside>
+        ) : null}
+      </AnimatePresence>
+
+      <div className="absolute bottom-4 right-4 z-20">
+        <button
+          onClick={() => setShowLegend((prev) => !prev)}
+          className="btn-glow flex items-center gap-2 rounded-xl border border-white/20 bg-slate-900/70 px-3 py-2 text-xs text-cyan-100 backdrop-blur-md hover:bg-slate-800/75"
+        >
+          <Info size={14} />
+          Legend
+        </button>
+      </div>
+
+      <AnimatePresence>
+        {showLegend ? (
+          <motion.div
+            initial={{ opacity: 0, y: 8 }}
+            animate={{ opacity: 1, y: 0 }}
+            exit={{ opacity: 0, y: 8 }}
+            className="absolute bottom-16 right-4 z-20 w-60 rounded-xl border border-white/20 bg-slate-900/70 p-3 text-xs text-white backdrop-blur-md"
+          >
+            <p className="mb-2 font-semibold">Ship Status Legend</p>
+            <div className="space-y-1.5 text-white/85">
+              <p className="flex items-center gap-2">
+                <span className="h-2.5 w-2.5 rounded-full bg-cyan-300" /> Normal
+              </p>
+              <p className="flex items-center gap-2">
+                <span className="h-2.5 w-2.5 rounded-full bg-amber-300" /> Warning / Rerouting
+              </p>
+              <p className="flex items-center gap-2">
+                <span className="h-2.5 w-2.5 rounded-full bg-red-400" /> Distress / Proximity
+              </p>
+            </div>
+          </motion.div>
+        ) : null}
+      </AnimatePresence>
+
+      <div className="pointer-events-none absolute left-1/2 top-4 z-10 -translate-x-1/2 rounded-full border border-white/15 bg-slate-900/65 px-4 py-2 text-xs text-white/80 backdrop-blur-md">
+        <p className="flex items-center gap-2">
+          <Navigation size={14} />
+          Strait of Hormuz Tactical Layer
+          <Waves size={14} />
+        </p>
+      </div>
     </div>
   );
 }

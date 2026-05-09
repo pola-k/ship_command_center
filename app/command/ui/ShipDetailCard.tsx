@@ -29,9 +29,12 @@ function statusTone(status: string): "ok" | "warn" | "danger" | "muted" {
 export function ShipDetailCard({
   ship,
   onClose,
+  showClose = true,
 }: {
   ship: ShipDetail;
   onClose: () => void;
+  /** Command can dismiss; captain bridge keeps detail pinned. */
+  showClose?: boolean;
 }) {
   const destTitle =
     ship.destination_port_name && ship.destination_port_id
@@ -54,14 +57,16 @@ export function ShipDetailCard({
             size="lg"
           />
         </div>
-        <button
-          type="button"
-          onClick={onClose}
-          className="inline-flex h-9 w-9 shrink-0 items-center justify-center rounded-xl border border-white/12 bg-white/5 text-white/70 hover:bg-white/10"
-          aria-label="Close ship detail"
-        >
-          <X size={16} />
-        </button>
+        {showClose ? (
+          <button
+            type="button"
+            onClick={onClose}
+            className="inline-flex h-9 w-9 shrink-0 items-center justify-center rounded-xl border border-white/12 bg-white/5 text-white/70 hover:bg-white/10"
+            aria-label="Close ship detail"
+          >
+            <X size={16} />
+          </button>
+        ) : null}
       </div>
 
       <div className="mt-4 grid grid-cols-2 gap-3 text-xs text-white/80">

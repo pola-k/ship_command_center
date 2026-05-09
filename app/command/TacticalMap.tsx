@@ -14,6 +14,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import maplibregl, { GeoJSONSource, LngLatBoundsLike, Map as MlMap } from "maplibre-gl";
 import "maplibre-gl/dist/maplibre-gl.css";
 
+import type { AppRole } from "@/app/lib/authRole";
 import { AO_BOUNDS, NAVIGABLE_WATER_LATLNG } from "@/lib/fleetConfig";
 import { parsePoint } from "@/lib/geo";
 import { supabase } from "@/lib/supabaseClient";
@@ -21,6 +22,13 @@ import { supabase } from "@/lib/supabaseClient";
 import { ShipDetailCard, type ShipDetail } from "./ui/ShipDetailCard";
 
 type HudPanel = "fleet" | "alerts" | "ports" | null;
+
+export type TacticalMapProps = {
+  mode?: AppRole;
+  captainShipId?: string | null;
+  captainShipName?: string | null;
+  captainDisplayName?: string | null;
+};
 
 type ShipMetaRow = {
   id: string;
@@ -151,7 +159,14 @@ const bounds: LngLatBoundsLike = [
   [AO_BOUNDS[1][0], AO_BOUNDS[1][1]],
 ];
 
-export default function TacticalMap() {
+export default function TacticalMap({
+  mode = "command",
+  captainShipId = null,
+  captainShipName = null,
+  captainDisplayName = null,
+}: TacticalMapProps) {
+  const isCaptain = mode === "captain" && Boolean(captainShipId);
+
   const mapRef = useRef<MlMap | null>(null);
   const mapContainerRef = useRef<HTMLDivElement | null>(null);
   const mapLoadedRef = useRef(false);
@@ -191,6 +206,16 @@ export default function TacticalMap() {
     for (const p of ports) m.set(p.id, p);
     return m;
   }, [ports]);
+
+  const hudButtons = useMemo(() => {
+    const items: { key: HudPanel; label: string; icon: typeof ShipWheel }[] = [
+      { key: "fleet", label: "Fleet", icon: ShipWheel },
+      { key: "alerts", label: "Alerts", icon: AlertTriangle },
+      { key: "ports", label: "Ports", icon: MapPin },
+    ];
+    if (isCaptain) return items.filter((i) => i.key !== "alerts");
+    return items;
+  }, [isCaptain]);
 
   const [fleetStatusCounts, setFleetStatusCounts] = useState({ normal: 0, warning: 0, distress: 0 });
   const [trackedShipCount, setTrackedShipCount] = useState(0);
@@ -412,7 +437,13 @@ export default function TacticalMap() {
       try {
         setDataState("loading");
 
-        const metaRes = await supabase.from("ships").select("id,name,cargo_type,destination_port_id");
+        let metaQuery = supabase
+          .from("ships")
+          .select("id,name,cargo_type,destination_port_id");
+        if (isCaptain && captainShipId) {
+          metaQuery = metaQuery.eq("id", captainShipId);
+        }
+        const metaRes = await metaQuery;
         if (metaRes.error) throw metaRes.error;
         const metaMap: Record<string, ShipMetaRow> = {};
         for (const row of (metaRes.data ?? []) as ShipMetaRow[]) metaMap[row.id] = row;
@@ -436,13 +467,21 @@ export default function TacticalMap() {
         }
         ensurePortsLayer({ type: "FeatureCollection", features });
 
-        const shipsRes = await supabase
+        let shipsQuery = supabase
           .from("ship_state_current")
           .select("ship_id,ts,position,speed_knots,heading_deg,fuel_tons,status");
+        if (isCaptain && captainShipId) {
+          shipsQuery = shipsQuery.eq("ship_id", captainShipId);
+        }
+        const shipsRes = await shipsQuery;
         if (shipsRes.error) throw shipsRes.error;
+
+        fixesRef.current = {};
+        renderPosRef.current = {};
 
         const nowMs = Date.now();
         for (const row of (shipsRes.data ?? []) as ShipStateRow[]) {
+          if (isCaptain && captainShipId && row.ship_id !== captainShipId) continue;
           const p = parsePoint(row.position);
           if (!p) continue;
           fixesRef.current[row.ship_id] = {
@@ -458,20 +497,36 @@ export default function TacticalMap() {
           renderPosRef.current[row.ship_id] = { lng: p.lng, lat: p.lat };
         }
 
-        if (!selectedShipId) {
-          const first = Object.keys(fixesRef.current)[0] ?? null;
-          if (first) setSelectedShipId(first);
+        if (isCaptain && captainShipId) {
+          setSelectedShipId(captainShipId);
+        } else {
+          setSelectedShipId((prev) => {
+            if (prev && fixesRef.current[prev]) return prev;
+            return Object.keys(fixesRef.current)[0] ?? null;
+          });
         }
 
-        const alertsRes = await supabase
-          .from("alerts")
-          .select("id,title,severity,created_at,status")
-          .eq("status", "active")
-          .order("severity", { ascending: false })
-          .order("created_at", { ascending: false })
-          .limit(8);
-        if (alertsRes.error) throw alertsRes.error;
-        if (!cancelled) setAlerts((alertsRes.data ?? []) as AlertRow[]);
+        const allowedIds = new Set(Object.keys(fixesRef.current));
+        for (const id of Object.keys(markersRef.current)) {
+          if (!allowedIds.has(id)) {
+            markersRef.current[id].marker.remove();
+            delete markersRef.current[id];
+          }
+        }
+
+        if (!isCaptain) {
+          const alertsRes = await supabase
+            .from("alerts")
+            .select("id,title,severity,created_at,status")
+            .eq("status", "active")
+            .order("severity", { ascending: false })
+            .order("created_at", { ascending: false })
+            .limit(8);
+          if (alertsRes.error) throw alertsRes.error;
+          if (!cancelled) setAlerts((alertsRes.data ?? []) as AlertRow[]);
+        } else if (!cancelled) {
+          setAlerts([]);
+        }
 
         if (!cancelled) {
           setTrackedShipCount(Object.keys(fixesRef.current).length);
@@ -486,26 +541,37 @@ export default function TacticalMap() {
     return () => {
       cancelled = true;
     };
-  }, []);
+  }, [isCaptain, captainShipId]);
 
   // Realtime ship updates
   useEffect(() => {
     const channel = supabase
       .channel("command_ship_state_current_rt")
       .on("postgres_changes", { event: "*", schema: "public", table: "ship_state_current" }, (payload) => {
-        const row: any = payload.new;
+        const row: Record<string, unknown> = payload.new as Record<string, unknown>;
+        const sid = row.ship_id as string;
+        if (isCaptain && captainShipId && sid !== captainShipId) return;
         const p = parsePoint(row.position);
         if (!p) return;
-        fixesRef.current[row.ship_id] = {
-          ship_id: row.ship_id,
-          tsMs: new Date(row.ts).getTime(),
+        fixesRef.current[sid] = {
+          ship_id: sid,
+          tsMs: new Date(row.ts as string).getTime(),
           lng: p.lng,
           lat: p.lat,
-          heading_deg: row.heading_deg,
-          speed_knots: row.speed_knots,
-          fuel_tons: row.fuel_tons ?? null,
-          status: row.status,
+          heading_deg: row.heading_deg as number,
+          speed_knots: row.speed_knots as number,
+          fuel_tons: (row.fuel_tons as number | null) ?? null,
+          status: row.status as string,
         };
+        if (isCaptain && captainShipId) {
+          const allowed = new Set([captainShipId]);
+          for (const id of Object.keys(fixesRef.current)) {
+            if (!allowed.has(id)) {
+              delete fixesRef.current[id];
+              delete renderPosRef.current[id];
+            }
+          }
+        }
         setTrackedShipCount(Object.keys(fixesRef.current).length);
         setDetailTick((t) => t + 1);
       })
@@ -513,10 +579,12 @@ export default function TacticalMap() {
     return () => {
       supabase.removeChannel(channel);
     };
-  }, []);
+  }, [isCaptain, captainShipId]);
 
-  // Realtime alerts list refresh (lightweight)
+  // Realtime alerts list refresh (command only)
   useEffect(() => {
+    if (isCaptain) return;
+
     const channel = supabase
       .channel("command_alerts_rt")
       .on("postgres_changes", { event: "*", schema: "public", table: "alerts" }, async () => {
@@ -533,7 +601,7 @@ export default function TacticalMap() {
     return () => {
       supabase.removeChannel(channel);
     };
-  }, []);
+  }, [isCaptain]);
 
   // RAF smoothing + marker management + distress pulse
   useEffect(() => {
@@ -688,9 +756,11 @@ export default function TacticalMap() {
     map.easeTo({
       center: [pos.lng, pos.lat],
       duration: 420,
-      padding: { left: 90, right: 380, top: 90, bottom: 90 },
+      padding: isCaptain
+        ? { left: 72, right: 72, top: 72, bottom: 72 }
+        : { left: 90, right: 380, top: 90, bottom: 90 },
     });
-  }, [selectedShipId, portById]);
+  }, [selectedShipId, portById, isCaptain]);
 
   return (
     <div className="relative h-screen w-screen overflow-hidden bg-[#183824]">
@@ -705,11 +775,7 @@ export default function TacticalMap() {
       />
 
       <div className="absolute left-4 top-1/2 z-20 -translate-y-1/2 space-y-3">
-        {[
-          { key: "fleet" as const, label: "Fleet", icon: ShipWheel },
-          { key: "alerts" as const, label: "Alerts", icon: AlertTriangle },
-          { key: "ports" as const, label: "Ports", icon: MapPin },
-        ].map((item) => (
+        {hudButtons.map((item) => (
           <button
             key={item.key}
             onClick={() => setHudPanel((prev) => (prev === item.key ? null : item.key))}
@@ -731,7 +797,7 @@ export default function TacticalMap() {
           >
             <div className="mb-3 flex items-center justify-between">
               <p className="text-sm font-semibold tracking-wide">
-                {hudPanel === "fleet" && "Fleet Statistics"}
+                {hudPanel === "fleet" && (isCaptain ? "My vessel" : "Fleet Statistics")}
                 {hudPanel === "alerts" && "Live Alerts"}
                 {hudPanel === "ports" && "Port Directory"}
               </p>
@@ -742,18 +808,40 @@ export default function TacticalMap() {
 
             {hudPanel === "fleet" ? (
               <div className="space-y-2 text-xs">
-                <div className="rounded-xl border border-white/15 bg-white/5 px-3 py-2">
-                  Active Ships: <span className="font-semibold">{trackedShipCount}</span>
-                </div>
-                <div className="rounded-xl border border-emerald-400/30 bg-emerald-500/10 px-3 py-2">
-                  Normal: <span className="font-semibold">{fleetStatusCounts.normal}</span>
-                </div>
-                <div className="rounded-xl border border-amber-400/30 bg-amber-500/10 px-3 py-2">
-                  Rerouting: <span className="font-semibold">{fleetStatusCounts.warning}</span>
-                </div>
-                <div className="rounded-xl border border-red-400/35 bg-red-500/10 px-3 py-2">
-                  Distressed: <span className="font-semibold">{fleetStatusCounts.distress}</span>
-                </div>
+                {isCaptain && captainShipId ? (
+                  <>
+                    <div className="rounded-xl border border-cyan-400/30 bg-cyan-500/10 px-3 py-2">
+                      <p className="text-[10px] uppercase tracking-wide text-cyan-200/70">
+                        Your vessel
+                      </p>
+                      <p className="mt-1 font-semibold text-white">
+                        {captainShipName ?? captainShipId}
+                      </p>
+                      <p className="text-[10px] text-white/50">{captainShipId}</p>
+                      {captainDisplayName ? (
+                        <p className="mt-1 text-white/70">Master: {captainDisplayName}</p>
+                      ) : null}
+                    </div>
+                    <div className="rounded-xl border border-white/15 bg-white/5 px-3 py-2">
+                      Fleet-wide statistics are restricted on captain bridge.
+                    </div>
+                  </>
+                ) : (
+                  <>
+                    <div className="rounded-xl border border-white/15 bg-white/5 px-3 py-2">
+                      Active Ships: <span className="font-semibold">{trackedShipCount}</span>
+                    </div>
+                    <div className="rounded-xl border border-emerald-400/30 bg-emerald-500/10 px-3 py-2">
+                      Normal: <span className="font-semibold">{fleetStatusCounts.normal}</span>
+                    </div>
+                    <div className="rounded-xl border border-amber-400/30 bg-amber-500/10 px-3 py-2">
+                      Rerouting: <span className="font-semibold">{fleetStatusCounts.warning}</span>
+                    </div>
+                    <div className="rounded-xl border border-red-400/35 bg-red-500/10 px-3 py-2">
+                      Distressed: <span className="font-semibold">{fleetStatusCounts.distress}</span>
+                    </div>
+                  </>
+                )}
                 <div className="rounded-xl border border-white/10 bg-black/20 px-3 py-2 text-white/60">
                   Data:{" "}
                   <span className="text-white/85">
@@ -838,7 +926,11 @@ export default function TacticalMap() {
             transition={{ type: "spring", stiffness: 320, damping: 28 }}
             className="absolute right-0 top-0 z-30 h-full w-[380px] border-l border-white/20 bg-slate-900/40 p-4 backdrop-blur-md"
           >
-            <ShipDetailCard ship={selectedShipDetail} onClose={() => setSelectedShipId(null)} />
+            <ShipDetailCard
+              ship={selectedShipDetail}
+              onClose={() => setSelectedShipId(null)}
+              showClose={!isCaptain}
+            />
           </motion.aside>
         ) : null}
       </AnimatePresence>
@@ -877,11 +969,29 @@ export default function TacticalMap() {
         ) : null}
       </AnimatePresence>
 
-      <div className="pointer-events-none absolute left-1/2 top-4 z-10 -translate-x-1/2 rounded-full border border-white/15 bg-slate-900/65 px-4 py-2 text-xs text-white/80 backdrop-blur-md">
-        <p className="flex items-center gap-2">
-          <Navigation size={14} />
-          Strait of Hormuz Tactical Layer
-          <Waves size={14} />
+      <div className="pointer-events-none absolute left-1/2 top-4 z-10 max-w-[min(96vw,520px)] -translate-x-1/2 rounded-full border border-white/15 bg-slate-900/65 px-4 py-2 text-center text-xs text-white/80 backdrop-blur-md">
+        <p className="flex flex-wrap items-center justify-center gap-2">
+          <Navigation size={14} className="shrink-0" />
+          {isCaptain && captainShipId ? (
+            <>
+              <span className="font-semibold text-cyan-100">
+                {captainShipName ?? captainShipId}
+              </span>
+              <span className="text-white/50">·</span>
+              <span>Captain bridge</span>
+              {captainDisplayName ? (
+                <>
+                  <span className="text-white/50">·</span>
+                  <span className="truncate text-white/70">{captainDisplayName}</span>
+                </>
+              ) : null}
+            </>
+          ) : (
+            <>
+              Strait of Hormuz Tactical Layer
+              <Waves size={14} className="shrink-0" />
+            </>
+          )}
         </p>
       </div>
     </div>

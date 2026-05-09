@@ -1,5 +1,7 @@
 -- Seed three command users for initial access testing.
 -- This migration is idempotent and can be re-run safely.
+-- pgcrypto provides crypt() / gen_salt(); ensure it exists if 0001 did not run first.
+create extension if not exists pgcrypto;
 
 with seed_users as (
   select *
@@ -49,7 +51,7 @@ upsert_auth as (
     'authenticated',
     'authenticated',
     su.email,
-    crypt(su.plain_password, gen_salt('bf')),
+    crypt(su.plain_password::text, gen_salt('bf'::text)),
     now(),
     '',
     '',

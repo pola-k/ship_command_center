@@ -34,13 +34,14 @@ values (
       '58.50 25.50,' ||
       '60.00 25.00,' ||
       '60.00 22.00,' ||
-      '60.00 22.50,' ||
       '58.80 23.80,' ||
       '57.20 24.50,' ||
-      '56.50 25.20,' ||
-      '56.45 26.45,' ||
-      '55.90 26.30,' ||
-      '55.50 26.00,' ||
+      '57.00 25.30,' ||
+      '56.70 26.10,' ||
+      '56.30 26.30,' ||
+      '56.00 26.40,' ||
+      '55.60 26.10,' ||
+      '55.50 25.50,' ||
       '54.50 25.30,' ||
       '53.00 24.80,' ||
       '52.00 25.30,' ||
@@ -64,9 +65,9 @@ values
   ('BAH-1', 'Manama',       ST_SetSRID(ST_MakePoint(50.55, 26.50), 4326)::geography),
   ('DOH-1', 'Doha',         ST_SetSRID(ST_MakePoint(51.95, 25.46), 4326)::geography),
   ('AUH-1', 'Abu Dhabi',    ST_SetSRID(ST_MakePoint(54.18, 25.22), 4326)::geography),
-  ('DXB-1', 'Jebel Ali',    ST_SetSRID(ST_MakePoint(54.75, 25.50), 4326)::geography),
+  ('DXB-1', 'Jebel Ali',    ST_SetSRID(ST_MakePoint(55.08, 24.88), 4326)::geography),
   ('BND-1', 'Bandar Abbas', ST_SetSRID(ST_MakePoint(56.11, 26.62), 4326)::geography),
-  ('SOH-1', 'Sohar',        ST_SetSRID(ST_MakePoint(57.02, 24.72), 4326)::geography),
+  ('SOH-1', 'Sohar',        ST_SetSRID(ST_MakePoint(56.73, 24.34), 4326)::geography),
   ('MCT-1', 'Muscat',       ST_SetSRID(ST_MakePoint(58.58, 23.92), 4326)::geography)
 on conflict (id) do nothing;
 

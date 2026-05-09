@@ -16,6 +16,14 @@ import "maplibre-gl/dist/maplibre-gl.css";
 
 import { AO_BOUNDS, NAVIGABLE_WATER_LATLNG } from "@/lib/fleetConfig";
 import { parsePoint } from "@/lib/geo";
+import { mpsFromKnots } from "@/lib/kinematics";
+import {
+  initialBearingDeg,
+  steerPreviewLngLat,
+  steerTowardPortWithCommitment,
+  type SteerCommitment,
+} from "@/lib/pathMotion";
+import { haversineM, pointInPolygon, snapLatLngIntoWater } from "@/lib/waterRouting";
 import { supabase } from "@/lib/supabaseClient";
 
 import { ShipDetailCard, type ShipDetail } from "./ui/ShipDetailCard";
@@ -53,40 +61,6 @@ function clamp(n: number, min: number, max: number) {
   return Math.max(min, Math.min(max, n));
 }
 
-function mpsFromKnots(knots: number) {
-  return (knots * 1852) / 3600;
-}
-
-function advanceLatLng({
-  lat,
-  lng,
-  headingDeg,
-  distanceM,
-}: {
-  lat: number;
-  lng: number;
-  headingDeg: number;
-  distanceM: number;
-}) {
-  const R = 6378137;
-  const brng = (headingDeg * Math.PI) / 180;
-  const lat1 = (lat * Math.PI) / 180;
-  const lng1 = (lng * Math.PI) / 180;
-
-  const lat2 = Math.asin(
-    Math.sin(lat1) * Math.cos(distanceM / R) +
-      Math.cos(lat1) * Math.sin(distanceM / R) * Math.cos(brng)
-  );
-  const lng2 =
-    lng1 +
-    Math.atan2(
-      Math.sin(brng) * Math.sin(distanceM / R) * Math.cos(lat1),
-      Math.cos(distanceM / R) - Math.sin(lat1) * Math.sin(lat2)
-    );
-
-  return { lat: (lat2 * 180) / Math.PI, lng: (lng2 * 180) / Math.PI };
-}
-
 type ShipFix = {
   ship_id: string;
   tsMs: number;
@@ -101,8 +75,20 @@ type ShipFix = {
 function shipTone(status: string, speedKnots: number) {
   if (status === "distressed") return { fill: "#ef4444", stroke: "rgba(255,255,255,0.85)" };
   if (status === "rerouting") return { fill: "#f59e0b", stroke: "rgba(255,255,255,0.8)" };
+  if (status === "stopped") return { fill: "#64748b", stroke: "rgba(255,255,255,0.55)" };
   if (speedKnots >= 15) return { fill: "#22c55e", stroke: "rgba(255,255,255,0.8)" };
   return { fill: "#38bdf8", stroke: "rgba(255,255,255,0.75)" };
+}
+
+function shipMarkerInnerHtml(headingDeg: number, fill: string, stroke: string) {
+  return `
+    <div style="width:34px;height:34px;transform:rotate(${headingDeg}deg);transform-origin:50% 50%;">
+      <svg width="34" height="34" viewBox="0 0 64 64" xmlns="http://www.w3.org/2000/svg">
+        <path d="M32 6 C38 14 43 24 46 36 L52 56 L32 50 L12 56 L18 36 C21 24 26 14 32 6 Z"
+          fill="${fill}" stroke="${stroke}" stroke-width="2.8" stroke-linejoin="round"/>
+        <path d="M32 10 L32 48" stroke="rgba(0,0,0,0.25)" stroke-width="2" stroke-linecap="round"/>
+      </svg>
+    </div>`;
 }
 
 function createShipMarkerElement({
@@ -110,13 +96,17 @@ function createShipMarkerElement({
   headingDeg,
   status,
   speedKnots,
+  yielding,
 }: {
   shipId: string;
   headingDeg: number;
   status: string;
   speedKnots: number;
+  yielding?: boolean;
 }) {
-  const { fill, stroke } = shipTone(status, speedKnots);
+  const tone = yielding
+    ? { fill: "#475569", stroke: "rgba(255,255,255,0.5)" }
+    : shipTone(status, speedKnots);
   const wrap = document.createElement("button");
   wrap.type = "button";
   wrap.setAttribute("aria-label", `Select ship ${shipId}`);
@@ -128,14 +118,7 @@ function createShipMarkerElement({
   wrap.style.padding = "0";
   wrap.style.cursor = "pointer";
 
-  wrap.innerHTML = `
-    <div style="width:34px;height:34px;transform:rotate(${headingDeg}deg);transform-origin:50% 50%;">
-      <svg width="34" height="34" viewBox="0 0 64 64" xmlns="http://www.w3.org/2000/svg">
-        <path d="M32 6 C38 14 43 24 46 36 L52 56 L32 50 L12 56 L18 36 C21 24 26 14 32 6 Z"
-          fill="${fill}" stroke="${stroke}" stroke-width="2.8" stroke-linejoin="round"/>
-        <path d="M32 10 L32 48" stroke="rgba(0,0,0,0.25)" stroke-width="2" stroke-linecap="round"/>
-      </svg>
-    </div>`;
+  wrap.innerHTML = shipMarkerInnerHtml(headingDeg, tone.fill, tone.stroke);
 
   return {
     el: wrap,
@@ -146,10 +129,53 @@ function createShipMarkerElement({
   };
 }
 
+function updateShipMarkerAppearance(
+  wrap: HTMLElement,
+  headingDeg: number,
+  status: string,
+  speedKnots: number,
+  yielding: boolean
+) {
+  const tone = yielding
+    ? { fill: "#475569", stroke: "rgba(255,255,255,0.5)" }
+    : shipTone(status, speedKnots);
+  wrap.innerHTML = shipMarkerInnerHtml(headingDeg, tone.fill, tone.stroke);
+}
+
 const bounds: LngLatBoundsLike = [
   [AO_BOUNDS[0][0], AO_BOUNDS[0][1]],
   [AO_BOUNDS[1][0], AO_BOUNDS[1][1]],
 ];
+
+const PROXIMITY_IN_M = 800;
+const PROXIMITY_OUT_M = 1300;
+const ARB_INTERVAL_MS = 450;
+/** Off by default so dense seeds are not all stopped by arbitration; set NEXT_PUBLIC_ENABLE_PROXIMITY_ARB=true to enable. */
+const PROXIMITY_ARB_ENABLED = process.env.NEXT_PUBLIC_ENABLE_PROXIMITY_ARB === "true";
+const POSITION_SYNC_MS = 800;
+const SIM_SPEED_MULTIPLIER = Math.max(
+  1,
+  Number.parseFloat(process.env.NEXT_PUBLIC_SIM_SPEED_MULT ?? "5000") || 5000
+);
+
+/** When another ship is this close (m), speed scales down; beyond CLEAR_M, full nominal speed. */
+const PAIRWISE_SLOW_CLOSE_M = 700;
+const PAIRWISE_SLOW_CLEAR_M = 4200;
+
+function pairwiseProximitySpeedFactor(nearestNeighborM: number): number {
+  if (nearestNeighborM >= PAIRWISE_SLOW_CLEAR_M) return 1;
+  if (nearestNeighborM <= PAIRWISE_SLOW_CLOSE_M) return 0.3;
+  const t =
+    (nearestNeighborM - PAIRWISE_SLOW_CLOSE_M) /
+    (PAIRWISE_SLOW_CLEAR_M - PAIRWISE_SLOW_CLOSE_M);
+  const s = t * t * (3 - 2 * t);
+  return 0.3 + 0.7 * s;
+}
+
+function pickStandOnShip(ida: string, fa: ShipFix, idb: string, fb: ShipFix): string {
+  if (fa.speed_knots !== fb.speed_knots) return fa.speed_knots > fb.speed_knots ? ida : idb;
+  return ida < idb ? ida : idb;
+}
 
 export default function TacticalMap() {
   const mapRef = useRef<MlMap | null>(null);
@@ -159,13 +185,28 @@ export default function TacticalMap() {
   const markersRef = useRef<
     Record<
       string,
-      { marker: maplibregl.Marker; setHeading: (deg: number) => void; lastHeading: number }
+      {
+        marker: maplibregl.Marker;
+        setHeading: (deg: number) => void;
+        lastHeading: number;
+        lastYielding?: boolean;
+      }
     >
   >({});
 
   const fixesRef = useRef<Record<string, ShipFix>>({});
   const renderPosRef = useRef<Record<string, { lng: number; lat: number }>>({});
   const metaRef = useRef<Record<string, ShipMetaRow>>({});
+
+  const simHeadingRef = useRef<Record<string, number>>({});
+  /** Per-ship: hold chosen bearing until land blocks; then re-search for closest-to-goal leg. */
+  const steerCommitRef = useRef<Record<string, SteerCommitment>>({});
+  const lastRafMsRef = useRef<number | null>(null);
+  const lastPosSyncMsRef = useRef(0);
+
+  const yieldPartnersRef = useRef<Map<string, Set<string>>>(new Map());
+  const arbitrationSavedRef = useRef<Map<string, { speed: number; status: string }>>(new Map());
+  const lastArbMsRef = useRef(0);
 
   const [ports, setPorts] = useState<PortRow[]>([]);
   const [alerts, setAlerts] = useState<AlertRow[]>([]);
@@ -183,7 +224,6 @@ export default function TacticalMap() {
 
   const [dataState, setDataState] = useState<"loading" | "ready" | "error">("loading");
   const [detailTick, setDetailTick] = useState(0);
-
   const pulsePhaseRef = useRef(0);
 
   const portById = useMemo(() => {
@@ -203,6 +243,10 @@ export default function TacticalMap() {
     const destId = meta?.destination_port_id ?? null;
     const destPort = destId ? portById.get(destId) : undefined;
     const destPt = destPort ? parsePoint(destPort.position) : null;
+    const ring = NAVIGABLE_WATER_LATLNG as [number, number][];
+    const destSnap = destPt
+      ? snapLatLngIntoWater({ lat: destPt.lat, lng: destPt.lng }, ring)
+      : null;
     return {
       ship_id: selectedShipId,
       name: meta?.name ?? selectedShipId,
@@ -213,8 +257,8 @@ export default function TacticalMap() {
       cargo_type: meta?.cargo_type ?? null,
       destination_port_id: destId,
       destination_port_name: destPort?.name ?? null,
-      destination_lat: destPt?.lat ?? null,
-      destination_lng: destPt?.lng ?? null,
+      destination_lat: destSnap?.lat ?? null,
+      destination_lng: destSnap?.lng ?? null,
     };
   }, [selectedShipId, detailTick, dataState, portById]);
 
@@ -381,6 +425,22 @@ export default function TacticalMap() {
         },
       });
 
+      map.addSource("all-routes", {
+        type: "geojson",
+        data: { type: "FeatureCollection", features: [] },
+      });
+      map.addLayer({
+        id: "all-routes-line",
+        type: "line",
+        source: "all-routes",
+        paint: {
+          "line-color": "#7dd3fc",
+          "line-opacity": 0.45,
+          "line-dasharray": [2, 3],
+          "line-width": 1.5,
+        },
+      });
+
       map.addSource("selected-route", {
         type: "geojson",
         data: { type: "FeatureCollection", features: [] },
@@ -424,14 +484,16 @@ export default function TacticalMap() {
         if (cancelled) return;
         setPorts(portsParsed);
 
+        const snapRing = NAVIGABLE_WATER_LATLNG as [number, number][];
         const features: GeoJSON.Feature<GeoJSON.Point>[] = [];
         for (const row of portsParsed) {
           const p = parsePoint(row.position);
           if (!p) continue;
+          const snapped = snapLatLngIntoWater({ lat: p.lat, lng: p.lng }, snapRing);
           features.push({
             type: "Feature",
             properties: { id: row.id, name: row.name },
-            geometry: { type: "Point", coordinates: [p.lng, p.lat] },
+            geometry: { type: "Point", coordinates: [snapped.lng, snapped.lat] },
           });
         }
         ensurePortsLayer({ type: "FeatureCollection", features });
@@ -445,22 +507,18 @@ export default function TacticalMap() {
         for (const row of (shipsRes.data ?? []) as ShipStateRow[]) {
           const p = parsePoint(row.position);
           if (!p) continue;
+          const snapped = snapLatLngIntoWater({ lat: p.lat, lng: p.lng }, snapRing);
           fixesRef.current[row.ship_id] = {
             ship_id: row.ship_id,
             tsMs: new Date(row.ts).getTime() || nowMs,
-            lng: p.lng,
-            lat: p.lat,
+            lng: snapped.lng,
+            lat: snapped.lat,
             heading_deg: row.heading_deg,
             speed_knots: row.speed_knots,
             fuel_tons: row.fuel_tons ?? null,
             status: row.status,
           };
-          renderPosRef.current[row.ship_id] = { lng: p.lng, lat: p.lat };
-        }
-
-        if (!selectedShipId) {
-          const first = Object.keys(fixesRef.current)[0] ?? null;
-          if (first) setSelectedShipId(first);
+          renderPosRef.current[row.ship_id] = { lng: snapped.lng, lat: snapped.lat };
         }
 
         const alertsRes = await supabase
@@ -496,16 +554,20 @@ export default function TacticalMap() {
         const row: any = payload.new;
         const p = parsePoint(row.position);
         if (!p) return;
+        const ring = NAVIGABLE_WATER_LATLNG as [number, number][];
+        const snapped = snapLatLngIntoWater({ lat: p.lat, lng: p.lng }, ring);
         fixesRef.current[row.ship_id] = {
           ship_id: row.ship_id,
           tsMs: new Date(row.ts).getTime(),
-          lng: p.lng,
-          lat: p.lat,
+          lng: snapped.lng,
+          lat: snapped.lat,
           heading_deg: row.heading_deg,
           speed_knots: row.speed_knots,
           fuel_tons: row.fuel_tons ?? null,
           status: row.status,
         };
+        const sid = row.ship_id as string;
+        renderPosRef.current[sid] = { lng: snapped.lng, lat: snapped.lat };
         setTrackedShipCount(Object.keys(fixesRef.current).length);
         setDetailTick((t) => t + 1);
       })
@@ -535,7 +597,7 @@ export default function TacticalMap() {
     };
   }, []);
 
-  // RAF smoothing + marker management + distress pulse
+  // RAF smoothing + marker management + distress pulse + proximity arbitration
   useEffect(() => {
     let raf = 0;
     const tick = () => {
@@ -547,30 +609,274 @@ export default function TacticalMap() {
         let distress = 0;
         const nextDistress = new Set<string>();
 
+        const ringPoly = NAVIGABLE_WATER_LATLNG as [number, number][];
+        const lastMs = lastRafMsRef.current ?? now;
+        const dt = Math.min((now - lastMs) / 1000, 0.12);
+        lastRafMsRef.current = now;
+
+        const prevPositions: Record<string, { lat: number; lng: number }> = {};
+        for (const sid of Object.keys(fixesRef.current)) {
+          const f = fixesRef.current[sid];
+          prevPositions[sid] = renderPosRef.current[sid] ?? { lng: f.lng, lat: f.lat };
+        }
+        const nearestNeighborM = (sid: string): number => {
+          const p = prevPositions[sid];
+          if (!p) return Infinity;
+          let best = Infinity;
+          for (const [other, q] of Object.entries(prevPositions)) {
+            if (other === sid) continue;
+            const d = haversineM(
+              { lat: p.lat, lng: p.lng },
+              { lat: q.lat, lng: q.lng }
+            );
+            if (d < best) best = d;
+          }
+          return best;
+        };
+
         for (const [shipId, fix] of Object.entries(fixesRef.current)) {
-          const dtS = clamp((now - fix.tsMs) / 1000, 0, 1.25);
-          const distanceM = mpsFromKnots(clamp(fix.speed_knots, 0, 40)) * dtS;
-          const adv = advanceLatLng({
-            lat: fix.lat,
-            lng: fix.lng,
-            headingDeg: fix.heading_deg,
-            distanceM,
-          });
-          renderPosRef.current[shipId] = { lng: adv.lng, lat: adv.lat };
+          const speedKn = fix.speed_knots;
+          const isHalted = fix.status === "stopped" || speedKn < 0.05;
+          const prevRender =
+            renderPosRef.current[shipId] ?? { lng: fix.lng, lat: fix.lat };
+
+          const baseTravelM =
+            mpsFromKnots(clamp(speedKn, 0, 40)) * dt * SIM_SPEED_MULTIPLIER;
+          const travelM =
+            baseTravelM * pairwiseProximitySpeedFactor(nearestNeighborM(shipId));
+
+          if (!isHalted) {
+            const meta = metaRef.current[shipId];
+            const destId = meta?.destination_port_id;
+            const destPort = destId ? portById.get(destId) : undefined;
+            const destPt = destPort ? parsePoint(destPort.position) : null;
+            let cur = prevRender;
+            if (!pointInPolygon({ lat: cur.lat, lng: cur.lng }, ringPoly)) {
+              cur = snapLatLngIntoWater({ lat: cur.lat, lng: cur.lng }, ringPoly);
+            }
+            if (destPt) {
+              const destInWater = snapLatLngIntoWater(
+                { lat: destPt.lat, lng: destPt.lng },
+                ringPoly
+              );
+              const destKey = destId ?? null;
+              if (!steerCommitRef.current[shipId]) {
+                steerCommitRef.current[shipId] = {
+                  destinationPortId: null,
+                  committedBearingDeg: null,
+                };
+              }
+              const st = steerCommitRef.current[shipId];
+              if (st.destinationPortId !== destKey) {
+                st.destinationPortId = destKey;
+                st.committedBearingDeg = null;
+              }
+              const step = steerTowardPortWithCommitment(
+                { lat: cur.lat, lng: cur.lng },
+                destInWater,
+                travelM,
+                ringPoly,
+                st
+              );
+              simHeadingRef.current[shipId] = step.bearingDeg;
+              renderPosRef.current[shipId] = {
+                lng: step.position.lng,
+                lat: step.position.lat,
+              };
+            } else {
+              delete steerCommitRef.current[shipId];
+              renderPosRef.current[shipId] = cur;
+            }
+          } else {
+            renderPosRef.current[shipId] = prevRender;
+            delete steerCommitRef.current[shipId];
+          }
 
           if (fix.status === "distressed") distress += 1;
           else if (fix.status === "rerouting") warning += 1;
           else normal += 1;
 
           if (fix.status === "distressed" || (fix.fuel_tons ?? 999999) < 1000) nextDistress.add(shipId);
+        }
 
+        const allRoutesSource = map.getSource("all-routes") as GeoJSONSource | undefined;
+        if (allRoutesSource && dataState === "ready") {
+          const routeFeatures: GeoJSON.Feature[] = [];
+          for (const shipId of Object.keys(fixesRef.current)) {
+            const shipPos = renderPosRef.current[shipId];
+            if (!shipPos) continue;
+            const meta = metaRef.current[shipId];
+            const destId = meta?.destination_port_id;
+            const destPort = destId ? portById.get(destId) : undefined;
+            const destPt = destPort ? parsePoint(destPort.position) : null;
+            if (!destPt) continue;
+            const destSnap = snapLatLngIntoWater(
+              { lat: destPt.lat, lng: destPt.lng },
+              ringPoly
+            );
+            const hdg =
+              simHeadingRef.current[shipId] ??
+              initialBearingDeg(
+                { lat: shipPos.lat, lng: shipPos.lng },
+                destSnap
+              );
+            const coords = steerPreviewLngLat(
+              { lat: shipPos.lat, lng: shipPos.lng },
+              hdg,
+              destSnap,
+              ringPoly
+            );
+            routeFeatures.push({
+              type: "Feature",
+              properties: { shipId },
+              geometry: { type: "LineString", coordinates: coords },
+            });
+          }
+          allRoutesSource.setData({ type: "FeatureCollection", features: routeFeatures });
+        } else if (allRoutesSource) {
+          allRoutesSource.setData({ type: "FeatureCollection", features: [] });
+        }
+
+        const pos = renderPosRef.current;
+        if (
+          PROXIMITY_ARB_ENABLED &&
+          now - lastArbMsRef.current >= ARB_INTERVAL_MS
+        ) {
+          lastArbMsRef.current = now;
+          const ids = Object.keys(fixesRef.current);
+
+          for (let i = 0; i < ids.length; i++) {
+            for (let j = i + 1; j < ids.length; j++) {
+              const ida = ids[i];
+              const idb = ids[j];
+              const pa = pos[ida];
+              const pb = pos[idb];
+              if (!pa || !pb) continue;
+              const fa = fixesRef.current[ida];
+              const fb = fixesRef.current[idb];
+              if (!fa || !fb) continue;
+              if (fa.status === "distressed" || fb.status === "distressed") continue;
+
+              const d = haversineM(
+                { lat: pa.lat, lng: pa.lng },
+                { lat: pb.lat, lng: pb.lng }
+              );
+
+              if (d < PROXIMITY_IN_M) {
+                const winner = pickStandOnShip(ida, fa, idb, fb);
+                const loser = winner === ida ? idb : ida;
+                let partners = yieldPartnersRef.current.get(loser);
+                if (!partners) {
+                  partners = new Set<string>();
+                  yieldPartnersRef.current.set(loser, partners);
+                }
+                if (!partners.has(winner)) {
+                  partners.add(winner);
+                  if (!arbitrationSavedRef.current.has(loser)) {
+                    const fl = fixesRef.current[loser];
+                    arbitrationSavedRef.current.set(loser, {
+                      speed: fl.speed_knots,
+                      status: fl.status,
+                    });
+                  }
+                  fixesRef.current[loser] = {
+                    ...fixesRef.current[loser],
+                    status: "stopped",
+                    speed_knots: 0,
+                  };
+                  void supabase
+                    .from("ship_state_current")
+                    .update({
+                      status: "stopped",
+                      speed_knots: 0,
+                      ts: new Date().toISOString(),
+                      extra: { arbitration_yield_to: winner },
+                    })
+                    .eq("ship_id", loser);
+                  void supabase.from("alerts").insert({
+                    type: "proximity_warning",
+                    severity: 3,
+                    title: `Proximity: ${loser} yielding to ${winner}`,
+                    source: "command_ui",
+                    ship_id: loser,
+                    related_ship_id: winner,
+                    payload: { distance_m: Math.round(d) },
+                  });
+                  setDetailTick((t) => t + 1);
+                }
+              }
+
+              if (d > PROXIMITY_OUT_M) {
+                const tryClearPair = (loser: string, winner: string) => {
+                  const ps = yieldPartnersRef.current.get(loser);
+                  if (!ps?.has(winner)) return;
+                  ps.delete(winner);
+                  if (ps.size === 0) {
+                    yieldPartnersRef.current.delete(loser);
+                    const saved = arbitrationSavedRef.current.get(loser);
+                    arbitrationSavedRef.current.delete(loser);
+                    if (saved && fixesRef.current[loser]) {
+                      fixesRef.current[loser] = {
+                        ...fixesRef.current[loser],
+                        status: saved.status,
+                        speed_knots: saved.speed,
+                      };
+                      void supabase
+                        .from("ship_state_current")
+                        .update({
+                          status: saved.status,
+                          speed_knots: saved.speed,
+                          ts: new Date().toISOString(),
+                          extra: {},
+                        })
+                        .eq("ship_id", loser);
+                      setDetailTick((t) => t + 1);
+                    }
+                  }
+                };
+                tryClearPair(ida, idb);
+                tryClearPair(idb, ida);
+              }
+            }
+          }
+        }
+
+        if (now - lastPosSyncMsRef.current >= POSITION_SYNC_MS) {
+          lastPosSyncMsRef.current = now;
+          for (const shipId of Object.keys(fixesRef.current)) {
+            const fix = fixesRef.current[shipId];
+            if (fix.status === "stopped") continue;
+            const r = renderPosRef.current[shipId];
+            if (!r) continue;
+            void supabase
+              .from("ship_state_current")
+              .update({
+                position: { type: "Point", coordinates: [r.lng, r.lat] },
+                ts: new Date().toISOString(),
+              })
+              .eq("ship_id", shipId);
+          }
+        }
+
+        const yieldingShips = new Set<string>();
+        yieldPartnersRef.current.forEach((partners, loser) => {
+          if (partners.size > 0) yieldingShips.add(loser);
+        });
+
+        for (const [shipId, fix] of Object.entries(fixesRef.current)) {
+          const adv = renderPosRef.current[shipId];
+          if (!adv) continue;
+
+          const yielding = yieldingShips.has(shipId);
+          const hdg = simHeadingRef.current[shipId] ?? fix.heading_deg;
           let m = markersRef.current[shipId];
           if (!m) {
             const { el, setHeading } = createShipMarkerElement({
               shipId,
-              headingDeg: fix.heading_deg,
+              headingDeg: hdg,
               status: fix.status,
               speedKnots: fix.speed_knots,
+              yielding,
             });
             el.addEventListener("click", () => setSelectedShipId(shipId));
             el.addEventListener("mouseenter", () => {
@@ -595,12 +901,27 @@ export default function TacticalMap() {
             const marker = new maplibregl.Marker({ element: el, anchor: "center" })
               .setLngLat([adv.lng, adv.lat])
               .addTo(map);
-            m = markersRef.current[shipId] = { marker, setHeading, lastHeading: fix.heading_deg };
+            m = markersRef.current[shipId] = {
+              marker,
+              setHeading,
+              lastHeading: hdg,
+              lastYielding: yielding,
+            };
           } else {
             m.marker.setLngLat([adv.lng, adv.lat]);
-            if (Math.abs(m.lastHeading - fix.heading_deg) > 0.1) {
-              m.setHeading(fix.heading_deg);
-              m.lastHeading = fix.heading_deg;
+            if (Math.abs(m.lastHeading - hdg) > 0.1) {
+              m.setHeading(hdg);
+              m.lastHeading = hdg;
+            }
+            if (m.lastYielding !== yielding) {
+              m.lastYielding = yielding;
+              updateShipMarkerAppearance(
+                m.marker.getElement(),
+                hdg,
+                fix.status,
+                fix.speed_knots,
+                yielding
+              );
             }
           }
         }
@@ -615,13 +936,13 @@ export default function TacticalMap() {
           pulseSource.setData({
             type: "FeatureCollection",
             features: Array.from(nextDistress).map((shipId) => {
-              const pos = renderPosRef.current[shipId];
+              const p = renderPosRef.current[shipId];
               return {
                 type: "Feature" as const,
                 properties: {},
                 geometry: {
                   type: "Point" as const,
-                  coordinates: [pos.lng, pos.lat],
+                  coordinates: [p.lng, p.lat],
                 },
               };
             }),
@@ -636,26 +957,36 @@ export default function TacticalMap() {
         }
 
         const routeSource = map.getSource("selected-route") as GeoJSONSource | undefined;
-        if (routeSource && selectedShipId) {
+        if (routeSource && selectedShipId && dataState === "ready") {
           const meta = metaRef.current[selectedShipId];
           const destId = meta?.destination_port_id;
           const destPort = destId ? portById.get(destId) : undefined;
           const destPos = destPort ? parsePoint(destPort.position) : null;
           const shipPos = renderPosRef.current[selectedShipId];
           if (shipPos && destPos) {
+            const destSnap = snapLatLngIntoWater(
+              { lat: destPos.lat, lng: destPos.lng },
+              ringPoly
+            );
+            const hdg =
+              simHeadingRef.current[selectedShipId] ??
+              initialBearingDeg(
+                { lat: shipPos.lat, lng: shipPos.lng },
+                destSnap
+              );
+            const coords = steerPreviewLngLat(
+              { lat: shipPos.lat, lng: shipPos.lng },
+              hdg,
+              destSnap,
+              ringPoly
+            );
             routeSource.setData({
               type: "FeatureCollection",
               features: [
                 {
                   type: "Feature",
                   properties: {},
-                  geometry: {
-                    type: "LineString",
-                    coordinates: [
-                      [shipPos.lng, shipPos.lat],
-                      [destPos.lng, destPos.lat],
-                    ],
-                  },
+                  geometry: { type: "LineString", coordinates: coords },
                 },
               ],
             });
@@ -669,7 +1000,7 @@ export default function TacticalMap() {
     };
     raf = requestAnimationFrame(tick);
     return () => cancelAnimationFrame(raf);
-  }, [portById, selectedShipId]);
+  }, [portById, selectedShipId, dataState]);
 
   useEffect(() => {
     const map = mapRef.current;

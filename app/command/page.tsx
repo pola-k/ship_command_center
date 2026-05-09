@@ -9,7 +9,6 @@ import TacticalMap from "./TacticalMap";
 export default function CommandPage() {
   const router = useRouter();
   const [loading, setLoading] = useState(true);
-  const [email, setEmail] = useState<string | null>(null);
 
   useEffect(() => {
     let mounted = true;
@@ -25,7 +24,6 @@ export default function CommandPage() {
         return;
       }
       if (mounted) {
-        setEmail(data.user.email ?? null);
         setLoading(false);
       }
     }
@@ -35,24 +33,13 @@ export default function CommandPage() {
     };
   }, [router]);
 
-  async function logout() {
-    await supabase.auth.signOut();
-    router.push("/login");
-  }
-
   return (
     <div className="relative min-h-dvh w-screen overflow-hidden bg-[#04131f] text-white">
-      <div className="absolute right-4 top-4 z-40 rounded-full border border-white/15 bg-slate-900/65 px-3 py-1.5 text-xs backdrop-blur-md">
-        <span className="text-white/80">Signed in:</span>{" "}
-        <span className="font-semibold text-white">{email ?? "—"}</span>
-      </div>
-      <button
-        onClick={logout}
-        disabled={loading}
-        className="btn-glow absolute right-4 top-14 z-40 rounded-xl border border-white/20 bg-slate-900/70 px-3 py-1.5 text-xs font-medium backdrop-blur-md hover:bg-slate-800/80 disabled:cursor-not-allowed disabled:opacity-70"
-      >
-        Log out
-      </button>
+      {loading ? (
+        <div className="absolute inset-0 z-40 flex items-center justify-center bg-black/40 text-sm text-white/70 backdrop-blur-sm">
+          Loading command dashboard…
+        </div>
+      ) : null}
       <TacticalMap />
     </div>
   );

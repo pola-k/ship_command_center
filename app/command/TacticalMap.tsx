@@ -13,111 +13,163 @@ import {
 import { useEffect, useMemo, useRef, useState } from "react";
 import maplibregl, { GeoJSONSource, LngLatBoundsLike, Map as MlMap } from "maplibre-gl";
 import "maplibre-gl/dist/maplibre-gl.css";
-import {
-  boundingBox,
-  initialFleet,
-  navigableWater,
-  ports,
-  rocks,
-  ShipState,
-} from "../lib/tacticalScenario";
+
+import { AO_BOUNDS, NAVIGABLE_WATER_LATLNG } from "@/lib/fleetConfig";
+import { parsePoint } from "@/lib/geo";
+import { supabase } from "@/lib/supabaseClient";
+
+import { ShipDetailCard, type ShipDetail } from "./ui/ShipDetailCard";
 
 type HudPanel = "fleet" | "alerts" | "ports" | null;
 
-type AlertItem = {
-  shipId: string;
-  shipName: string;
-  rockName: string;
-  distanceKm: number;
+type ShipMetaRow = {
+  id: string;
+  name: string | null;
+  cargo_type: string | null;
+  destination_port_id: string | null;
 };
 
-function degToRad(value: number) {
-  return (value * Math.PI) / 180;
+type ShipStateRow = {
+  ship_id: string;
+  ts: string;
+  position: unknown;
+  speed_knots: number;
+  heading_deg: number;
+  fuel_tons: number | null;
+  status: string;
+};
+
+type PortRow = { id: string; name: string; position: unknown };
+
+type AlertRow = {
+  id: string;
+  title: string;
+  severity: number;
+  created_at: string;
+  status: string;
+};
+
+function clamp(n: number, min: number, max: number) {
+  return Math.max(min, Math.min(max, n));
 }
 
-function haversineKm(a: [number, number], b: [number, number]) {
-  const [lat1, lon1] = a;
-  const [lat2, lon2] = b;
-  const r = 6371;
-  const dLat = degToRad(lat2 - lat1);
-  const dLon = degToRad(lon2 - lon1);
-  const s1 = Math.sin(dLat / 2) ** 2;
-  const s2 = Math.cos(degToRad(lat1)) * Math.cos(degToRad(lat2)) * Math.sin(dLon / 2) ** 2;
-  return 2 * r * Math.asin(Math.sqrt(s1 + s2));
+function mpsFromKnots(knots: number) {
+  return (knots * 1852) / 3600;
 }
 
-function clampToBounds(point: [number, number]): [number, number] {
-  return [
-    Math.max(boundingBox.south, Math.min(boundingBox.north, point[0])),
-    Math.max(boundingBox.west, Math.min(boundingBox.east, point[1])),
-  ];
+function advanceLatLng({
+  lat,
+  lng,
+  headingDeg,
+  distanceM,
+}: {
+  lat: number;
+  lng: number;
+  headingDeg: number;
+  distanceM: number;
+}) {
+  const R = 6378137;
+  const brng = (headingDeg * Math.PI) / 180;
+  const lat1 = (lat * Math.PI) / 180;
+  const lng1 = (lng * Math.PI) / 180;
+
+  const lat2 = Math.asin(
+    Math.sin(lat1) * Math.cos(distanceM / R) +
+      Math.cos(lat1) * Math.sin(distanceM / R) * Math.cos(brng)
+  );
+  const lng2 =
+    lng1 +
+    Math.atan2(
+      Math.sin(brng) * Math.sin(distanceM / R) * Math.cos(lat1),
+      Math.cos(distanceM / R) - Math.sin(lat1) * Math.sin(lat2)
+    );
+
+  return { lat: (lat2 * 180) / Math.PI, lng: (lng2 * 180) / Math.PI };
 }
 
-function advanceShip(ship: ShipState, deltaSec: number): ShipState {
-  const distanceNm = (ship.speed / 3600) * deltaSec;
-  const h = degToRad(ship.heading);
-  const latRad = degToRad(ship.position[0]);
+type ShipFix = {
+  ship_id: string;
+  tsMs: number;
+  lng: number;
+  lat: number;
+  heading_deg: number;
+  speed_knots: number;
+  fuel_tons: number | null;
+  status: string;
+};
 
-  const dLatDeg = (distanceNm * Math.cos(h)) / 60;
-  const dLngDeg = (distanceNm * Math.sin(h)) / (60 * Math.max(0.25, Math.cos(latRad)));
+function shipTone(status: string, speedKnots: number) {
+  if (status === "distressed") return { fill: "#ef4444", stroke: "rgba(255,255,255,0.85)" };
+  if (status === "rerouting") return { fill: "#f59e0b", stroke: "rgba(255,255,255,0.8)" };
+  if (speedKnots >= 15) return { fill: "#22c55e", stroke: "rgba(255,255,255,0.8)" };
+  return { fill: "#38bdf8", stroke: "rgba(255,255,255,0.75)" };
+}
 
-  const nextPos = clampToBounds([ship.position[0] + dLatDeg, ship.position[1] + dLngDeg]);
+function createShipMarkerElement({
+  shipId,
+  headingDeg,
+  status,
+  speedKnots,
+}: {
+  shipId: string;
+  headingDeg: number;
+  status: string;
+  speedKnots: number;
+}) {
+  const { fill, stroke } = shipTone(status, speedKnots);
+  const wrap = document.createElement("button");
+  wrap.type = "button";
+  wrap.setAttribute("aria-label", `Select ship ${shipId}`);
+  wrap.className = "ship-dom-marker";
+  wrap.style.width = "34px";
+  wrap.style.height = "34px";
+  wrap.style.background = "transparent";
+  wrap.style.border = "none";
+  wrap.style.padding = "0";
+  wrap.style.cursor = "pointer";
 
-  let nextHeading = ship.heading;
-  if (nextPos[0] === boundingBox.south || nextPos[0] === boundingBox.north) {
-    nextHeading = (180 - nextHeading + 360) % 360;
-  }
-  if (nextPos[1] === boundingBox.west || nextPos[1] === boundingBox.east) {
-    nextHeading = (360 - nextHeading) % 360;
-  }
+  wrap.innerHTML = `
+    <div style="width:34px;height:34px;transform:rotate(${headingDeg}deg);transform-origin:50% 50%;">
+      <svg width="34" height="34" viewBox="0 0 64 64" xmlns="http://www.w3.org/2000/svg">
+        <path d="M32 6 C38 14 43 24 46 36 L52 56 L32 50 L12 56 L18 36 C21 24 26 14 32 6 Z"
+          fill="${fill}" stroke="${stroke}" stroke-width="2.8" stroke-linejoin="round"/>
+        <path d="M32 10 L32 48" stroke="rgba(0,0,0,0.25)" stroke-width="2" stroke-linecap="round"/>
+      </svg>
+    </div>`;
 
   return {
-    ...ship,
-    position: nextPos,
-    heading: nextHeading,
-    fuel: Math.max(0, ship.fuel - deltaSec * 0.025),
+    el: wrap,
+    setHeading: (deg: number) => {
+      const inner = wrap.firstElementChild as HTMLElement | null;
+      if (inner) inner.style.transform = `rotate(${deg}deg)`;
+    },
   };
-}
-
-function fleetToGeoJson(fleet: ShipState[]): GeoJSON.FeatureCollection<GeoJSON.Point> {
-  return {
-    type: "FeatureCollection",
-    features: fleet.map((ship) => ({
-      type: "Feature",
-      properties: {
-        shipId: ship.shipId,
-        name: ship.name,
-        speed: ship.speed,
-        heading: ship.heading,
-        destination: ship.destination,
-        fuel: ship.fuel,
-        cargo: ship.cargo,
-        status: ship.status,
-      },
-      geometry: {
-        type: "Point",
-        coordinates: [ship.position[1], ship.position[0]],
-      },
-    })),
-  };
-}
-
-function computeStatus(ship: ShipState, nearHazardKm: number): ShipState["status"] {
-  if (ship.fuel < 1000 || nearHazardKm <= 2) return "distress";
-  if (nearHazardKm <= 8 || ship.fuel < 2000) return "warning";
-  return "normal";
 }
 
 const bounds: LngLatBoundsLike = [
-  [boundingBox.west, boundingBox.south],
-  [boundingBox.east, boundingBox.north],
+  [AO_BOUNDS[0][0], AO_BOUNDS[0][1]],
+  [AO_BOUNDS[1][0], AO_BOUNDS[1][1]],
 ];
 
 export default function TacticalMap() {
   const mapRef = useRef<MlMap | null>(null);
   const mapContainerRef = useRef<HTMLDivElement | null>(null);
-  const [fleet, setFleet] = useState<ShipState[]>(initialFleet);
-  const fleetRef = useRef<ShipState[]>(initialFleet);
+  const mapLoadedRef = useRef(false);
+
+  const markersRef = useRef<
+    Record<
+      string,
+      { marker: maplibregl.Marker; setHeading: (deg: number) => void; lastHeading: number }
+    >
+  >({});
+
+  const fixesRef = useRef<Record<string, ShipFix>>({});
+  const renderPosRef = useRef<Record<string, { lng: number; lat: number }>>({});
+  const metaRef = useRef<Record<string, ShipMetaRow>>({});
+
+  const [ports, setPorts] = useState<PortRow[]>([]);
+  const [alerts, setAlerts] = useState<AlertRow[]>([]);
+
   const [selectedShipId, setSelectedShipId] = useState<string | null>(null);
   const [hudPanel, setHudPanel] = useState<HudPanel>(null);
   const [showLegend, setShowLegend] = useState(false);
@@ -126,193 +178,52 @@ export default function TacticalMap() {
     y: number;
     shipId: string;
     speed: number;
-    status: ShipState["status"];
+    status: string;
   } | null>(null);
+
+  const [dataState, setDataState] = useState<"loading" | "ready" | "error">("loading");
+  const [detailTick, setDetailTick] = useState(0);
+
   const pulsePhaseRef = useRef(0);
 
-  const selectedShip = useMemo(
-    () => fleet.find((ship) => ship.shipId === selectedShipId) ?? null,
-    [fleet, selectedShipId]
-  );
-
-  const alerts = useMemo(() => {
-    const nextAlerts: AlertItem[] = [];
-    for (const ship of fleet) {
-      for (const rock of rocks) {
-        const d = haversineKm(ship.position, rock.position);
-        if (d <= 18) {
-          nextAlerts.push({
-            shipId: ship.shipId,
-            shipName: ship.name,
-            rockName: rock.name,
-            distanceKm: Number(d.toFixed(1)),
-          });
-        }
-      }
-    }
-    nextAlerts.sort((a, b) => a.distanceKm - b.distanceKm);
-    return nextAlerts.slice(0, 8);
-  }, [fleet]);
-
-  const distressShipIds = useMemo(() => {
-    const ids = new Set<string>();
-    for (const alert of alerts) {
-      if (alert.distanceKm <= 2) ids.add(alert.shipId);
-    }
-    for (const ship of fleet) {
-      if (ship.fuel < 1000) ids.add(ship.shipId);
-    }
-    return ids;
-  }, [alerts, fleet]);
-
-  const fleetStatusCounts = useMemo(() => {
-    let normal = 0;
-    let warning = 0;
-    let distress = 0;
-    for (const ship of fleet) {
-      const nearest = rocks
-        .map((rock) => haversineKm(ship.position, rock.position))
-        .sort((a, b) => a - b)[0];
-      const status = computeStatus(ship, nearest ?? 999);
-      if (status === "normal") normal += 1;
-      if (status === "warning") warning += 1;
-      if (status === "distress") distress += 1;
-    }
-    return { normal, warning, distress };
-  }, [fleet]);
-
   const portById = useMemo(() => {
-    const m = new Map<string, (typeof ports)[number]>();
-    for (const port of ports) m.set(port.id, port);
+    const m = new Map<string, PortRow>();
+    for (const p of ports) m.set(p.id, p);
     return m;
-  }, []);
+  }, [ports]);
 
-  useEffect(() => {
-    fleetRef.current = fleet;
-  }, [fleet]);
+  const [fleetStatusCounts, setFleetStatusCounts] = useState({ normal: 0, warning: 0, distress: 0 });
+  const [trackedShipCount, setTrackedShipCount] = useState(0);
 
-  useEffect(() => {
-    if (!mapContainerRef.current || mapRef.current) return;
+  const selectedShipDetail: ShipDetail | null = useMemo(() => {
+    if (!selectedShipId) return null;
+    const fix = fixesRef.current[selectedShipId];
+    const meta = metaRef.current[selectedShipId];
+    if (!fix) return null;
+    const destId = meta?.destination_port_id ?? null;
+    const destPort = destId ? portById.get(destId) : undefined;
+    const destPt = destPort ? parsePoint(destPort.position) : null;
+    return {
+      ship_id: selectedShipId,
+      name: meta?.name ?? selectedShipId,
+      status: fix.status,
+      speed_knots: fix.speed_knots,
+      heading_deg: fix.heading_deg,
+      fuel_tons: fix.fuel_tons,
+      cargo_type: meta?.cargo_type ?? null,
+      destination_port_id: destId,
+      destination_port_name: destPort?.name ?? null,
+      destination_lat: destPt?.lat ?? null,
+      destination_lng: destPt?.lng ?? null,
+    };
+  }, [selectedShipId, detailTick, dataState, portById]);
 
-    const map = new maplibregl.Map({
-      container: mapContainerRef.current,
-      style: {
-        version: 8,
-        sources: {},
-        layers: [{ id: "bg", type: "background", paint: { "background-color": "#2d4a2f" } }],
-      },
-      center: [54.5, 26.2],
-      zoom: 5.6,
-      minZoom: 5.2,
-      maxZoom: 8.8,
-      maxBounds: bounds,
-      attributionControl: false,
-      cooperativeGestures: true,
-    });
+  const ensurePortsLayer = (fc: GeoJSON.FeatureCollection<GeoJSON.Point>) => {
+    const map = mapRef.current;
+    if (!map || !mapLoadedRef.current) return;
 
-    mapRef.current = map;
-
-    map.on("load", () => {
-      const waterCoords = navigableWater.map(([lat, lng]) => [lng, lat]);
-
-      const hatchFeatures: GeoJSON.Feature<GeoJSON.LineString>[] = [];
-      const step = 0.7;
-      for (let lat = boundingBox.south - 1; lat <= boundingBox.north + 1; lat += step) {
-        hatchFeatures.push({
-          type: "Feature",
-          properties: {},
-          geometry: {
-            type: "LineString",
-            coordinates: [
-              [boundingBox.west - 1, lat],
-              [boundingBox.east + 1, lat + 1.1],
-            ],
-          },
-        });
-      }
-      for (let lng = boundingBox.west - 1; lng <= boundingBox.east + 1; lng += step * 1.5) {
-        hatchFeatures.push({
-          type: "Feature",
-          properties: {},
-          geometry: {
-            type: "LineString",
-            coordinates: [
-              [lng, boundingBox.south - 1],
-              [lng + 1.1, boundingBox.north + 1],
-            ],
-          },
-        });
-      }
-
-      map.addSource("land-hatch", {
-        type: "geojson",
-        data: {
-          type: "FeatureCollection",
-          features: hatchFeatures,
-        },
-      });
-      map.addLayer({
-        id: "land-hatch",
-        type: "line",
-        source: "land-hatch",
-        paint: {
-          "line-color": "#486a41",
-          "line-opacity": 0.22,
-          "line-width": 1,
-        },
-      });
-
-      map.addSource("water", {
-        type: "geojson",
-        data: {
-          type: "Feature",
-          properties: {},
-          geometry: {
-            type: "Polygon",
-            coordinates: [waterCoords],
-          },
-        },
-      });
-      map.addLayer({
-        id: "water-fill",
-        type: "fill",
-        source: "water",
-        paint: {
-          "fill-color": "#1a365d",
-          "fill-opacity": 0.78,
-        },
-      });
-      map.addLayer({
-        id: "water-depth",
-        type: "fill",
-        source: "water",
-        paint: {
-          "fill-color": "#1d4b73",
-          "fill-opacity": 0.24,
-        },
-      });
-      map.addLayer({
-        id: "water-outline",
-        type: "line",
-        source: "water",
-        paint: {
-          "line-color": "#58c7ee",
-          "line-opacity": 0.36,
-          "line-width": 1.5,
-        },
-      });
-
-      map.addSource("ports", {
-        type: "geojson",
-        data: {
-          type: "FeatureCollection",
-          features: ports.map((port) => ({
-            type: "Feature",
-            properties: { id: port.id, name: port.name },
-            geometry: { type: "Point", coordinates: [port.position[1], port.position[0]] },
-          })),
-        },
-      });
+    if (!map.getSource("ports")) {
+      map.addSource("ports", { type: "geojson", data: fc });
       map.addLayer({
         id: "ports-circle",
         type: "circle",
@@ -330,66 +241,132 @@ export default function TacticalMap() {
         source: "ports",
         layout: {
           "text-field": ["get", "name"],
-          "text-size": 11,
-          "text-offset": [0, 1.2],
+          "text-size": 12,
+          "text-offset": [0, 1.25],
           "text-anchor": "top",
+          "text-allow-overlap": true,
+          "text-ignore-placement": true,
+          "text-optional": false,
         },
-        paint: { "text-color": "#f8fafc", "text-halo-color": "#022338", "text-halo-width": 1.2 },
+        paint: {
+          "text-color": "#f8fafc",
+          "text-halo-color": "#022338",
+          "text-halo-width": 1.4,
+        },
+      });
+    } else {
+      const src = map.getSource("ports") as GeoJSONSource;
+      src.setData(fc);
+      if (map.getLayer("ports-label")) {
+        map.setLayoutProperty("ports-label", "text-allow-overlap", true);
+        map.setLayoutProperty("ports-label", "text-ignore-placement", true);
+        map.setLayoutProperty("ports-label", "text-optional", false);
+        map.setLayoutProperty("ports-label", "text-size", 12);
+      }
+    }
+  };
+
+  useEffect(() => {
+    if (!mapContainerRef.current || mapRef.current) return;
+
+    const map = new maplibregl.Map({
+      container: mapContainerRef.current,
+      style: {
+        version: 8,
+        sources: {},
+        layers: [{ id: "bg", type: "background", paint: { "background-color": "#2d4a2f" } }],
+      },
+      center: [(AO_BOUNDS[0][0] + AO_BOUNDS[1][0]) / 2, (AO_BOUNDS[0][1] + AO_BOUNDS[1][1]) / 2],
+      zoom: 5.6,
+      minZoom: 5.2,
+      maxZoom: 8.8,
+      maxBounds: bounds,
+      attributionControl: false,
+      cooperativeGestures: true,
+    });
+
+    mapRef.current = map;
+
+    map.on("load", () => {
+      mapLoadedRef.current = true;
+
+      const waterCoords = NAVIGABLE_WATER_LATLNG.map(([lat, lng]) => [lng, lat]);
+
+      const west = AO_BOUNDS[0][0];
+      const south = AO_BOUNDS[0][1];
+      const east = AO_BOUNDS[1][0];
+      const north = AO_BOUNDS[1][1];
+
+      const hatchFeatures: GeoJSON.Feature<GeoJSON.LineString>[] = [];
+      const step = 0.7;
+      for (let lat = south - 1; lat <= north + 1; lat += step) {
+        hatchFeatures.push({
+          type: "Feature",
+          properties: {},
+          geometry: {
+            type: "LineString",
+            coordinates: [
+              [west - 1, lat],
+              [east + 1, lat + 1.1],
+            ],
+          },
+        });
+      }
+      for (let lng = west - 1; lng <= east + 1; lng += step * 1.5) {
+        hatchFeatures.push({
+          type: "Feature",
+          properties: {},
+          geometry: {
+            type: "LineString",
+            coordinates: [
+              [lng, south - 1],
+              [lng + 1.1, north + 1],
+            ],
+          },
+        });
+      }
+
+      map.addSource("land-hatch", {
+        type: "geojson",
+        data: { type: "FeatureCollection", features: hatchFeatures },
+      });
+      map.addLayer({
+        id: "land-hatch",
+        type: "line",
+        source: "land-hatch",
+        paint: { "line-color": "#486a41", "line-opacity": 0.22, "line-width": 1 },
       });
 
-      map.addSource("rocks", {
+      map.addSource("water", {
         type: "geojson",
         data: {
-          type: "FeatureCollection",
-          features: rocks.map((rock) => ({
-            type: "Feature",
-            properties: { id: rock.id, name: rock.name },
-            geometry: { type: "Point", coordinates: [rock.position[1], rock.position[0]] },
-          })),
+          type: "Feature",
+          properties: {},
+          geometry: { type: "Polygon", coordinates: [waterCoords] },
         },
       });
       map.addLayer({
-        id: "rocks-ring",
-        type: "circle",
-        source: "rocks",
-        paint: {
-          "circle-color": "#ef4444",
-          "circle-opacity": 0.12,
-          "circle-radius": 11,
-          "circle-stroke-color": "#fca5a5",
-          "circle-stroke-width": 1.2,
-        },
+        id: "water-fill",
+        type: "fill",
+        source: "water",
+        paint: { "fill-color": "#1a365d", "fill-opacity": 0.78 },
       });
       map.addLayer({
-        id: "rocks",
-        type: "symbol",
-        source: "rocks",
-        layout: {
-          "text-field": "▲",
-          "text-size": 15,
-        },
-        paint: { "text-color": "#f87171" },
+        id: "water-depth",
+        type: "fill",
+        source: "water",
+        paint: { "fill-color": "#1d4b73", "fill-opacity": 0.24 },
+      });
+      map.addLayer({
+        id: "water-outline",
+        type: "line",
+        source: "water",
+        paint: { "line-color": "#58c7ee", "line-opacity": 0.36, "line-width": 1.5 },
       });
 
-      map.addSource("ships", { type: "geojson", data: fleetToGeoJson(fleetRef.current) });
-      map.addLayer({
-        id: "ship-ring",
-        type: "circle",
-        source: "ships",
-        paint: {
-          "circle-color": "#38bdf8",
-          "circle-radius": 7,
-          "circle-opacity": 0.25,
-          "circle-stroke-width": 1,
-          "circle-stroke-color": "#7dd3fc",
-        },
-      });
       map.addSource("ship-pulse", {
         type: "geojson",
-        data: {
-          type: "FeatureCollection",
-          features: [],
-        },
+        data: { type: "FeatureCollection", features: [] },
       });
       map.addLayer({
         id: "ship-pulse-ring",
@@ -403,25 +380,10 @@ export default function TacticalMap() {
           "circle-stroke-width": 1,
         },
       });
-      map.addLayer({
-        id: "ship-heading",
-        type: "symbol",
-        source: "ships",
-        layout: {
-          "text-field": "➤",
-          "text-size": 18,
-          "text-rotate": ["get", "heading"],
-          "text-allow-overlap": true,
-        },
-        paint: { "text-color": "#e2e8f0" },
-      });
 
       map.addSource("selected-route", {
         type: "geojson",
-        data: {
-          type: "FeatureCollection",
-          features: [],
-        },
+        data: { type: "FeatureCollection", features: [] },
       });
       map.addLayer({
         id: "selected-route-line",
@@ -434,134 +396,301 @@ export default function TacticalMap() {
           "line-width": 2,
         },
       });
-
-      map.on("click", "ship-heading", (e) => {
-        const shipId = e.features?.[0]?.properties?.shipId as string | undefined;
-        if (shipId) setSelectedShipId(shipId);
-      });
-      map.on("mousemove", "ship-heading", (e) => {
-        const feature = e.features?.[0];
-        if (!feature?.properties) return;
-        const p = feature.properties as { shipId: string; speed: number; status: ShipState["status"] };
-        setHoverCard({
-          x: e.point.x,
-          y: e.point.y,
-          shipId: p.shipId,
-          speed: Number(p.speed),
-          status: p.status,
-        });
-      });
-      map.on("mouseenter", "ship-heading", () => {
-        map.getCanvas().style.cursor = "pointer";
-      });
-      map.on("mouseleave", "ship-heading", () => {
-        map.getCanvas().style.cursor = "";
-        setHoverCard(null);
-      });
     });
 
     return () => {
       map.remove();
       mapRef.current = null;
+      mapLoadedRef.current = false;
     };
   }, []);
 
+  // Initial load: ships meta, ports, ship_state_current, alerts
+  useEffect(() => {
+    let cancelled = false;
+    async function load() {
+      try {
+        setDataState("loading");
+
+        const metaRes = await supabase.from("ships").select("id,name,cargo_type,destination_port_id");
+        if (metaRes.error) throw metaRes.error;
+        const metaMap: Record<string, ShipMetaRow> = {};
+        for (const row of (metaRes.data ?? []) as ShipMetaRow[]) metaMap[row.id] = row;
+        metaRef.current = metaMap;
+
+        const portsRes = await supabase.from("ports").select("id,name,position");
+        if (portsRes.error) throw portsRes.error;
+        const portsParsed: PortRow[] = (portsRes.data ?? []) as PortRow[];
+        if (cancelled) return;
+        setPorts(portsParsed);
+
+        const features: GeoJSON.Feature<GeoJSON.Point>[] = [];
+        for (const row of portsParsed) {
+          const p = parsePoint(row.position);
+          if (!p) continue;
+          features.push({
+            type: "Feature",
+            properties: { id: row.id, name: row.name },
+            geometry: { type: "Point", coordinates: [p.lng, p.lat] },
+          });
+        }
+        ensurePortsLayer({ type: "FeatureCollection", features });
+
+        const shipsRes = await supabase
+          .from("ship_state_current")
+          .select("ship_id,ts,position,speed_knots,heading_deg,fuel_tons,status");
+        if (shipsRes.error) throw shipsRes.error;
+
+        const nowMs = Date.now();
+        for (const row of (shipsRes.data ?? []) as ShipStateRow[]) {
+          const p = parsePoint(row.position);
+          if (!p) continue;
+          fixesRef.current[row.ship_id] = {
+            ship_id: row.ship_id,
+            tsMs: new Date(row.ts).getTime() || nowMs,
+            lng: p.lng,
+            lat: p.lat,
+            heading_deg: row.heading_deg,
+            speed_knots: row.speed_knots,
+            fuel_tons: row.fuel_tons ?? null,
+            status: row.status,
+          };
+          renderPosRef.current[row.ship_id] = { lng: p.lng, lat: p.lat };
+        }
+
+        if (!selectedShipId) {
+          const first = Object.keys(fixesRef.current)[0] ?? null;
+          if (first) setSelectedShipId(first);
+        }
+
+        const alertsRes = await supabase
+          .from("alerts")
+          .select("id,title,severity,created_at,status")
+          .eq("status", "active")
+          .order("severity", { ascending: false })
+          .order("created_at", { ascending: false })
+          .limit(8);
+        if (alertsRes.error) throw alertsRes.error;
+        if (!cancelled) setAlerts((alertsRes.data ?? []) as AlertRow[]);
+
+        if (!cancelled) {
+          setTrackedShipCount(Object.keys(fixesRef.current).length);
+          setDetailTick((t) => t + 1);
+          setDataState("ready");
+        }
+      } catch {
+        if (!cancelled) setDataState("error");
+      }
+    }
+    load();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  // Realtime ship updates
+  useEffect(() => {
+    const channel = supabase
+      .channel("command_ship_state_current_rt")
+      .on("postgres_changes", { event: "*", schema: "public", table: "ship_state_current" }, (payload) => {
+        const row: any = payload.new;
+        const p = parsePoint(row.position);
+        if (!p) return;
+        fixesRef.current[row.ship_id] = {
+          ship_id: row.ship_id,
+          tsMs: new Date(row.ts).getTime(),
+          lng: p.lng,
+          lat: p.lat,
+          heading_deg: row.heading_deg,
+          speed_knots: row.speed_knots,
+          fuel_tons: row.fuel_tons ?? null,
+          status: row.status,
+        };
+        setTrackedShipCount(Object.keys(fixesRef.current).length);
+        setDetailTick((t) => t + 1);
+      })
+      .subscribe();
+    return () => {
+      supabase.removeChannel(channel);
+    };
+  }, []);
+
+  // Realtime alerts list refresh (lightweight)
+  useEffect(() => {
+    const channel = supabase
+      .channel("command_alerts_rt")
+      .on("postgres_changes", { event: "*", schema: "public", table: "alerts" }, async () => {
+        const alertsRes = await supabase
+          .from("alerts")
+          .select("id,title,severity,created_at,status")
+          .eq("status", "active")
+          .order("severity", { ascending: false })
+          .order("created_at", { ascending: false })
+          .limit(8);
+        if (!alertsRes.error) setAlerts((alertsRes.data ?? []) as AlertRow[]);
+      })
+      .subscribe();
+    return () => {
+      supabase.removeChannel(channel);
+    };
+  }, []);
+
+  // RAF smoothing + marker management + distress pulse
   useEffect(() => {
     let raf = 0;
-    let last = performance.now();
+    const tick = () => {
+      const now = Date.now();
+      const map = mapRef.current;
+      if (map) {
+        let normal = 0;
+        let warning = 0;
+        let distress = 0;
+        const nextDistress = new Set<string>();
 
-    const tick = (now: number) => {
-      const dt = Math.min(0.2, (now - last) / 1000);
-      last = now;
+        for (const [shipId, fix] of Object.entries(fixesRef.current)) {
+          const dtS = clamp((now - fix.tsMs) / 1000, 0, 1.25);
+          const distanceM = mpsFromKnots(clamp(fix.speed_knots, 0, 40)) * dtS;
+          const adv = advanceLatLng({
+            lat: fix.lat,
+            lng: fix.lng,
+            headingDeg: fix.heading_deg,
+            distanceM,
+          });
+          renderPosRef.current[shipId] = { lng: adv.lng, lat: adv.lat };
 
-      const nextFleet = fleetRef.current.map((ship) => {
-        const moved = advanceShip(ship, dt);
-        const nearest = rocks
-          .map((rock) => haversineKm(moved.position, rock.position))
-          .sort((a, b) => a - b)[0];
-        return { ...moved, status: computeStatus(moved, nearest ?? 999) };
-      });
-      fleetRef.current = nextFleet;
-      setFleet(nextFleet);
+          if (fix.status === "distressed") distress += 1;
+          else if (fix.status === "rerouting") warning += 1;
+          else normal += 1;
 
-      const source = mapRef.current?.getSource("ships") as GeoJSONSource | undefined;
-      if (source) source.setData(fleetToGeoJson(nextFleet));
+          if (fix.status === "distressed" || (fix.fuel_tons ?? 999999) < 1000) nextDistress.add(shipId);
 
-      const pulseSource = mapRef.current?.getSource("ship-pulse") as GeoJSONSource | undefined;
-      if (pulseSource) {
-        pulseSource.setData({
-          type: "FeatureCollection",
-          features: nextFleet
-            .filter((ship) => distressShipIds.has(ship.shipId))
-            .map((ship) => ({
-              type: "Feature" as const,
-              properties: {},
-              geometry: {
-                type: "Point" as const,
-                coordinates: [ship.position[1], ship.position[0]],
-              },
-            })),
-        });
-      }
-      if (mapRef.current?.getLayer("ship-pulse-ring")) {
-        pulsePhaseRef.current += dt * 2.8;
-        const wave = 10 + (Math.sin(pulsePhaseRef.current) + 1) * 4;
-        const op = 0.18 + (Math.sin(pulsePhaseRef.current) + 1) * 0.15;
-        mapRef.current.setPaintProperty("ship-pulse-ring", "circle-radius", wave);
-        mapRef.current.setPaintProperty("ship-pulse-ring", "circle-opacity", op);
+          let m = markersRef.current[shipId];
+          if (!m) {
+            const { el, setHeading } = createShipMarkerElement({
+              shipId,
+              headingDeg: fix.heading_deg,
+              status: fix.status,
+              speedKnots: fix.speed_knots,
+            });
+            el.addEventListener("click", () => setSelectedShipId(shipId));
+            el.addEventListener("mouseenter", () => {
+              map.getCanvas().style.cursor = "pointer";
+            });
+            el.addEventListener("mouseleave", () => {
+              map.getCanvas().style.cursor = "";
+              setHoverCard(null);
+            });
+            el.addEventListener("mousemove", (ev) => {
+              const rect = mapContainerRef.current?.getBoundingClientRect();
+              if (!rect) return;
+              setHoverCard({
+                x: ev.clientX - rect.left,
+                y: ev.clientY - rect.top,
+                shipId,
+                speed: fix.speed_knots,
+                status: fix.status,
+              });
+            });
+
+            const marker = new maplibregl.Marker({ element: el, anchor: "center" })
+              .setLngLat([adv.lng, adv.lat])
+              .addTo(map);
+            m = markersRef.current[shipId] = { marker, setHeading, lastHeading: fix.heading_deg };
+          } else {
+            m.marker.setLngLat([adv.lng, adv.lat]);
+            if (Math.abs(m.lastHeading - fix.heading_deg) > 0.1) {
+              m.setHeading(fix.heading_deg);
+              m.lastHeading = fix.heading_deg;
+            }
+          }
+        }
+
+        setFleetStatusCounts((prev) =>
+          prev.normal === normal && prev.warning === warning && prev.distress === distress
+            ? prev
+            : { normal, warning, distress }
+        );
+        const pulseSource = map.getSource("ship-pulse") as GeoJSONSource | undefined;
+        if (pulseSource) {
+          pulseSource.setData({
+            type: "FeatureCollection",
+            features: Array.from(nextDistress).map((shipId) => {
+              const pos = renderPosRef.current[shipId];
+              return {
+                type: "Feature" as const,
+                properties: {},
+                geometry: {
+                  type: "Point" as const,
+                  coordinates: [pos.lng, pos.lat],
+                },
+              };
+            }),
+          });
+        }
+        if (map.getLayer("ship-pulse-ring")) {
+          pulsePhaseRef.current += 0.016 * 2.8;
+          const wave = 10 + (Math.sin(pulsePhaseRef.current) + 1) * 4;
+          const op = 0.18 + (Math.sin(pulsePhaseRef.current) + 1) * 0.15;
+          map.setPaintProperty("ship-pulse-ring", "circle-radius", wave);
+          map.setPaintProperty("ship-pulse-ring", "circle-opacity", op);
+        }
+
+        const routeSource = map.getSource("selected-route") as GeoJSONSource | undefined;
+        if (routeSource && selectedShipId) {
+          const meta = metaRef.current[selectedShipId];
+          const destId = meta?.destination_port_id;
+          const destPort = destId ? portById.get(destId) : undefined;
+          const destPos = destPort ? parsePoint(destPort.position) : null;
+          const shipPos = renderPosRef.current[selectedShipId];
+          if (shipPos && destPos) {
+            routeSource.setData({
+              type: "FeatureCollection",
+              features: [
+                {
+                  type: "Feature",
+                  properties: {},
+                  geometry: {
+                    type: "LineString",
+                    coordinates: [
+                      [shipPos.lng, shipPos.lat],
+                      [destPos.lng, destPos.lat],
+                    ],
+                  },
+                },
+              ],
+            });
+          } else {
+            routeSource.setData({ type: "FeatureCollection", features: [] });
+          }
+        }
       }
 
       raf = requestAnimationFrame(tick);
     };
-
     raf = requestAnimationFrame(tick);
     return () => cancelAnimationFrame(raf);
-  }, [distressShipIds]);
+  }, [portById, selectedShipId]);
 
   useEffect(() => {
     const map = mapRef.current;
     if (!map?.isStyleLoaded()) return;
-
     const routeSource = map.getSource("selected-route") as GeoJSONSource | undefined;
     if (!routeSource) return;
 
-    if (!selectedShip) {
+    if (!selectedShipId) {
       routeSource.setData({ type: "FeatureCollection", features: [] });
       map.easeTo({ padding: { left: 0, right: 0, top: 0, bottom: 0 }, duration: 350 });
       return;
     }
 
-    const destinationPort = portById.get(selectedShip.destination);
-    if (!destinationPort) return;
-
-    routeSource.setData({
-      type: "FeatureCollection",
-      features: [
-        {
-          type: "Feature",
-          properties: {},
-          geometry: {
-            type: "LineString",
-            coordinates: [
-              [selectedShip.position[1], selectedShip.position[0]],
-              [destinationPort.position[1], destinationPort.position[0]],
-            ],
-          },
-        },
-      ],
-    });
+    const pos = renderPosRef.current[selectedShipId] ?? null;
+    if (!pos) return;
     map.easeTo({
-      center: [selectedShip.position[1], selectedShip.position[0]],
+      center: [pos.lng, pos.lat],
       duration: 420,
-      padding: { left: 90, right: 350, top: 90, bottom: 90 },
+      padding: { left: 90, right: 380, top: 90, bottom: 90 },
     });
-  }, [selectedShip, portById]);
-
-  function statusTone(status: ShipState["status"]) {
-    if (status === "distress") return "text-red-200 border-red-400/40 bg-red-500/15";
-    if (status === "warning") return "text-amber-100 border-amber-400/40 bg-amber-500/15";
-    return "text-cyan-100 border-cyan-400/30 bg-cyan-500/10";
-  }
+  }, [selectedShipId, portById]);
 
   return (
     <div className="relative h-screen w-screen overflow-hidden bg-[#183824]">
@@ -614,16 +743,22 @@ export default function TacticalMap() {
             {hudPanel === "fleet" ? (
               <div className="space-y-2 text-xs">
                 <div className="rounded-xl border border-white/15 bg-white/5 px-3 py-2">
-                  Active Ships: <span className="font-semibold">{fleet.length}</span>
+                  Active Ships: <span className="font-semibold">{trackedShipCount}</span>
                 </div>
                 <div className="rounded-xl border border-emerald-400/30 bg-emerald-500/10 px-3 py-2">
                   Normal: <span className="font-semibold">{fleetStatusCounts.normal}</span>
                 </div>
                 <div className="rounded-xl border border-amber-400/30 bg-amber-500/10 px-3 py-2">
-                  Warning: <span className="font-semibold">{fleetStatusCounts.warning}</span>
+                  Rerouting: <span className="font-semibold">{fleetStatusCounts.warning}</span>
                 </div>
                 <div className="rounded-xl border border-red-400/35 bg-red-500/10 px-3 py-2">
-                  Distress: <span className="font-semibold">{fleetStatusCounts.distress}</span>
+                  Distressed: <span className="font-semibold">{fleetStatusCounts.distress}</span>
+                </div>
+                <div className="rounded-xl border border-white/10 bg-black/20 px-3 py-2 text-white/60">
+                  Data:{" "}
+                  <span className="text-white/85">
+                    {dataState === "ready" ? "Supabase live" : dataState === "error" ? "error" : "loading"}
+                  </span>
                 </div>
               </div>
             ) : null}
@@ -632,15 +767,23 @@ export default function TacticalMap() {
               <div className="space-y-2 text-xs">
                 {alerts.length === 0 ? (
                   <p className="rounded-xl border border-emerald-300/30 bg-emerald-500/10 px-3 py-2 text-emerald-100">
-                    No active geofence/proximity warnings.
+                    No active alerts.
                   </p>
                 ) : (
-                  alerts.map((alert) => (
+                  alerts.map((a) => (
                     <div
-                      key={`${alert.shipId}-${alert.rockName}`}
+                      key={a.id}
                       className="rounded-xl border border-red-400/30 bg-red-500/10 px-3 py-2 text-red-100"
                     >
-                      {alert.shipName} near {alert.rockName} ({alert.distanceKm} km)
+                      <div className="flex items-start justify-between gap-2">
+                        <span className="font-semibold">{a.title}</span>
+                        <span className="rounded-full border border-white/10 bg-black/20 px-2 py-0.5 text-[10px] text-white/70">
+                          S{a.severity}
+                        </span>
+                      </div>
+                      <div className="mt-1 text-[10px] text-red-100/70">
+                        {new Date(a.created_at).toLocaleString()}
+                      </div>
                     </div>
                   ))
                 )}
@@ -649,15 +792,18 @@ export default function TacticalMap() {
 
             {hudPanel === "ports" ? (
               <div className="max-h-80 space-y-2 overflow-auto pr-1 text-xs">
-                {ports.map((port) => (
-                  <div key={port.id} className="rounded-xl border border-white/15 bg-white/5 px-3 py-2">
-                    <p className="font-semibold text-white">{port.name}</p>
-                    <p className="text-white/70">{port.id}</p>
-                    <p className="text-white/70">
-                      [{port.position[0].toFixed(2)}, {port.position[1].toFixed(2)}]
-                    </p>
-                  </div>
-                ))}
+                {ports.map((port) => {
+                  const p = parsePoint(port.position);
+                  return (
+                    <div key={port.id} className="rounded-xl border border-white/15 bg-white/5 px-3 py-2">
+                      <p className="font-semibold text-white">{port.name}</p>
+                      <p className="text-white/70">{port.id}</p>
+                      <p className="text-white/70">
+                        {p ? `${p.lat.toFixed(3)}, ${p.lng.toFixed(3)}` : "position unavailable"}
+                      </p>
+                    </div>
+                  );
+                })}
               </div>
             ) : null}
           </motion.div>
@@ -677,42 +823,22 @@ export default function TacticalMap() {
             }}
           >
             <p className="font-semibold">{hoverCard.shipId}</p>
-            <p>Speed: {Math.round(hoverCard.speed)} kn</p>
+            <p>Speed: {hoverCard.speed.toFixed(1)} kn</p>
             <p>Status: {hoverCard.status}</p>
           </motion.div>
         ) : null}
       </AnimatePresence>
 
       <AnimatePresence>
-        {selectedShip ? (
+        {selectedShipDetail ? (
           <motion.aside
             initial={{ x: 360 }}
             animate={{ x: 0 }}
             exit={{ x: 360 }}
             transition={{ type: "spring", stiffness: 320, damping: 28 }}
-            className="absolute right-0 top-0 z-30 h-full w-[340px] border-l border-white/20 bg-slate-900/65 p-4 text-white backdrop-blur-md"
+            className="absolute right-0 top-0 z-30 h-full w-[380px] border-l border-white/20 bg-slate-900/40 p-4 backdrop-blur-md"
           >
-            <div className="mb-4 flex items-center justify-between">
-              <h2 className="text-sm font-semibold tracking-wide">Ship Detail</h2>
-              <button
-                onClick={() => setSelectedShipId(null)}
-                className="rounded-md p-1 hover:bg-white/10"
-              >
-                <X size={15} />
-              </button>
-            </div>
-            <div className="space-y-2 text-sm text-white/85">
-              <p className="text-lg font-semibold text-white">{selectedShip.name}</p>
-              <p>Ship ID: {selectedShip.shipId}</p>
-              <p>Cargo: {selectedShip.cargo}</p>
-              <p>Fuel: {Math.round(selectedShip.fuel)} tons</p>
-              <p>Destination: {selectedShip.destination}</p>
-              <p>Speed: {selectedShip.speed} knots</p>
-              <p>Heading: {Math.round(selectedShip.heading)}°</p>
-              <div className={`mt-3 rounded-xl border px-3 py-2 text-xs ${statusTone(selectedShip.status)}`}>
-                Operational Status: {selectedShip.status.toUpperCase()}
-              </div>
-            </div>
+            <ShipDetailCard ship={selectedShipDetail} onClose={() => setSelectedShipId(null)} />
           </motion.aside>
         ) : null}
       </AnimatePresence>
@@ -741,10 +867,10 @@ export default function TacticalMap() {
                 <span className="h-2.5 w-2.5 rounded-full bg-cyan-300" /> Normal
               </p>
               <p className="flex items-center gap-2">
-                <span className="h-2.5 w-2.5 rounded-full bg-amber-300" /> Warning / Rerouting
+                <span className="h-2.5 w-2.5 rounded-full bg-amber-300" /> Rerouting
               </p>
               <p className="flex items-center gap-2">
-                <span className="h-2.5 w-2.5 rounded-full bg-red-400" /> Distress / Proximity
+                <span className="h-2.5 w-2.5 rounded-full bg-red-400" /> Distressed
               </p>
             </div>
           </motion.div>
@@ -761,4 +887,3 @@ export default function TacticalMap() {
     </div>
   );
 }
-

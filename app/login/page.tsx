@@ -1,9 +1,9 @@
 "use client";
 
 import { useRouter } from "next/navigation";
-import { useEffect, useState } from "react";
+import { useState } from "react";
 import { Anchor, Lock, Ship, User } from "lucide-react";
-import { getUserRole } from "../lib/authRole";
+import { resolveUserRole } from "../lib/authRole";
 import { supabase } from "../lib/supabaseClient";
 
 export default function LoginPage() {
@@ -12,11 +12,6 @@ export default function LoginPage() {
   const [password, setPassword] = useState("");
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [isLoaded, setIsLoaded] = useState(false);
-
-  useEffect(() => {
-    setIsLoaded(true);
-  }, []);
 
   async function onSubmit(e: React.FormEvent) {
     e.preventDefault();
@@ -29,7 +24,7 @@ export default function LoginPage() {
       });
       if (error) throw error;
 
-      const role = getUserRole(data.user);
+      const role = await resolveUserRole(supabase, data.user);
       if (!role) {
         router.push("/choose-role");
         return;
@@ -70,10 +65,7 @@ export default function LoginPage() {
       </div>
 
       <main
-        className={[
-          "relative z-10 w-full max-w-[420px] px-6 transition-all duration-1000 transform",
-          isLoaded ? "translate-y-0 opacity-100" : "translate-y-10 opacity-0",
-        ].join(" ")}
+        className="relative z-10 w-full max-w-[420px] px-6 transition-all duration-1000 transform translate-y-0 opacity-100"
       >
         <div className="bg-white/[0.07] backdrop-blur-[20px] border border-white/20 rounded-[45px] p-10 md:p-12 shadow-[0_25px_60px_rgba(0,0,0,0.4)]">
           <div className="text-center mb-10">

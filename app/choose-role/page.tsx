@@ -3,7 +3,7 @@
 import { useEffect, useState } from "react";
 import { useRouter } from "next/navigation";
 import type { AppRole } from "../lib/authRole";
-import { getUserRole } from "../lib/authRole";
+import { resolveUserRole } from "../lib/authRole";
 import { supabase } from "../lib/supabaseClient";
 
 export default function ChooseRolePage() {
@@ -20,7 +20,7 @@ export default function ChooseRolePage() {
         router.replace("/login");
         return;
       }
-      const existing = getUserRole(data.user);
+      const existing = await resolveUserRole(supabase, data.user);
       if (existing) {
         router.replace(existing === "captain" ? "/captain" : "/command");
         return;

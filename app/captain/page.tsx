@@ -2,7 +2,7 @@
 
 import { useEffect, useState } from "react";
 import { useRouter } from "next/navigation";
-import { getUserRole } from "../lib/authRole";
+import { resolveUserRole } from "../lib/authRole";
 import { supabase } from "../lib/supabaseClient";
 import { Card, InlineLink, PrimaryButton } from "../lib/ui";
 
@@ -15,11 +15,11 @@ export default function CaptainPage() {
     let mounted = true;
     async function load() {
       const { data } = await supabase.auth.getUser();
-      const role = getUserRole(data.user);
       if (!data.user) {
         router.replace("/login");
         return;
       }
+      const role = await resolveUserRole(supabase, data.user);
       if (role !== "captain") {
         router.replace("/command");
         return;

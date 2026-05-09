@@ -11,7 +11,7 @@ import {
   ShieldAlert,
   X,
 } from "lucide-react";
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useState, type ReactNode } from "react";
 import { createCriticalCaptainOrder } from "@/app/lib/directiveOrders";
 import type { ShipIntel } from "@/app/data/ships";
 import { supabase } from "@/lib/supabaseClient";
@@ -28,6 +28,11 @@ type Props = {
   className?: string;
   /** When set, enables “bridge alert” to ship captains (matches `ships.id` e.g. MV-1). */
   commandUserId?: string | null;
+  /**
+   * When set, the threat launcher is passed here; return your tactical map (or other layout)
+   * with `leadingRail={threatLauncher}` so the button aligns with Zone Architect / HUD.
+   */
+  renderTacticalMap?: (threatLauncher: ReactNode) => ReactNode;
 };
 
 const distressStyles: Record<
@@ -75,6 +80,7 @@ export default function ThreatPanel({
   ships,
   className = "",
   commandUserId = null,
+  renderTacticalMap,
 }: Props) {
   const [scanTick, setScanTick] = useState(0);
   const [clientReady, setClientReady] = useState(false);
@@ -129,26 +135,40 @@ export default function ThreatPanel({
     setAlertOpen(true);
   }
 
-  return (
-    <div className={`pointer-events-none absolute inset-0 z-[21] ${className}`}>
-      {/* Same visual language as TacticalMap HUD: round glass button, stacked above Fleet/Alerts/Ports */}
-      <div className="pointer-events-auto absolute left-4 top-1/2 z-[21] -translate-y-[calc(50%+6.75rem)]">
-        <button
-          type="button"
-          onClick={togglePanel}
-          aria-expanded={panelOpen}
-          aria-controls="ai-threat-floating-panel"
-          title="Threats"
-          className={`btn-glow flex h-11 w-11 cursor-pointer items-center justify-center rounded-full border text-cyan-100 backdrop-blur-md transition hover:bg-slate-800/75 ${
-            panelOpen
-              ? "border-cyan-400/50 bg-cyan-500/25 shadow-[0_0_18px_rgba(34,211,238,0.35)]"
-              : "border-white/20 bg-slate-900/70"
-          }`}
-        >
-          <BrainCircuit size={18} strokeWidth={2} aria-hidden />
-        </button>
-      </div>
+  const threatLauncher = (
+    <button
+      type="button"
+      onClick={togglePanel}
+      aria-expanded={panelOpen}
+      aria-controls="ai-threat-floating-panel"
+      title="Threats"
+      className={`btn-glow flex h-11 w-11 shrink-0 cursor-pointer items-center justify-center rounded-full border text-cyan-100 backdrop-blur-md transition hover:bg-slate-800/75 ${
+        panelOpen
+          ? "border-cyan-400/50 bg-cyan-500/25 shadow-[0_0_18px_rgba(34,211,238,0.35)]"
+          : "border-white/20 bg-slate-900/70"
+      }`}
+    >
+      <BrainCircuit size={18} strokeWidth={2} aria-hidden />
+    </button>
+  );
 
+  const launcherWrap = (
+    <div className="pointer-events-auto shrink-0">{threatLauncher}</div>
+  );
+
+  return (
+    <>
+      {renderTacticalMap ? (
+        renderTacticalMap(launcherWrap)
+      ) : (
+        <div className={`pointer-events-none absolute inset-0 z-[21] ${className}`}>
+          <div className="pointer-events-auto absolute left-4 top-1/2 z-[21] -translate-y-[calc(50%+6.75rem)]">
+            {launcherWrap}
+          </div>
+        </div>
+      )}
+
+      <div className={`pointer-events-none absolute inset-0 z-[21] ${className}`}>
       <AnimatePresence>
         {panelOpen ? (
           <motion.div
@@ -348,7 +368,8 @@ export default function ThreatPanel({
           />
         ) : null}
       </AnimatePresence>
-    </div>
+      </div>
+    </>
   );
 }
 

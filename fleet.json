@@ -9,6 +9,11 @@
     "fuel": "tons",
     "heading": "degrees from true north (0-360)"
   },
+  "operationalRules": {
+    "captainLowFuelDistressTons": 2000,
+    "captainLowFuelResetHysteresis": 1.15,
+    "captainDistressSeverity": 5
+  },
   "boundingBox": {
     "north": 30.5,
     "south": 22.0,

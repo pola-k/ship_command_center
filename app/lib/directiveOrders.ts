@@ -25,7 +25,12 @@ const CRITICAL_PAYLOAD_KEYS = {
 } as const;
 
 export function isShipCriticallyDistressed(status: string): boolean {
-  return status === "distressed";
+  return (
+    status === "distressed" ||
+    status === "insufficient_fuel" ||
+    status === "out_of_fuel" ||
+    status === "stranded"
+  );
 }
 
 /**

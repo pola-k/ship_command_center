@@ -38,7 +38,14 @@ export async function POST(req: Request) {
 
   let updated = 0;
   for (const row of rows ?? []) {
-    if (row.status === "stopped" || row.status === "distressed" || row.status === "arrived") {
+    if (
+      row.status === "stopped" ||
+      row.status === "distressed" ||
+      row.status === "stranded" ||
+      row.status === "insufficient_fuel" ||
+      row.status === "out_of_fuel" ||
+      row.status === "arrived"
+    ) {
       continue;
     }
     const p = parsePoint(row.position);

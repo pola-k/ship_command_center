@@ -53,27 +53,33 @@ export default function CommandPage() {
           Loading command dashboard…
         </div>
       ) : null}
-      {!loading && session && !isCaptain ? (
-        <ThreatPanel
-          ships={fleetShipsIntel}
-          commandUserId={session.userId}
-        />
-      ) : null}
       {!loading && session ? (
-        <TacticalMap
-          mode={session.role}
-          captainShipId={
-            session.role === "captain" ? session.captainShipId : null
-          }
-          captainShipName={
-            session.role === "captain" ? session.captainShipName : null
-          }
-          captainDisplayName={
-            session.role === "captain" ? session.displayName : null
-          }
-          commandUserId={session.role === "command" ? session.userId : null}
-          captainUserId={session.role === "captain" ? session.userId : null}
-        />
+        session.role === "command" ? (
+          <ThreatPanel
+            ships={fleetShipsIntel}
+            commandUserId={session.userId}
+            renderTacticalMap={(launcher) => (
+              <TacticalMap
+                mode="command"
+                captainShipId={null}
+                captainShipName={null}
+                captainDisplayName={null}
+                commandUserId={session.userId}
+                captainUserId={null}
+                leadingRail={launcher}
+              />
+            )}
+          />
+        ) : (
+          <TacticalMap
+            mode="captain"
+            captainShipId={session.captainShipId}
+            captainShipName={session.captainShipName}
+            captainDisplayName={session.displayName}
+            commandUserId={null}
+            captainUserId={session.userId}
+          />
+        )
       ) : null}
     </div>
   );

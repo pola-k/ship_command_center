@@ -34,6 +34,7 @@ export type ShipDetail = {
 
 function statusTone(status: string): "ok" | "warn" | "danger" | "muted" {
   if (status === "distressed") return "danger";
+  if (status === "insufficient_fuel" || status === "out_of_fuel") return "danger";
   if (status === "rerouting") return "warn";
   if (status === "stranded") return "danger";
   if (status === "normal") return "ok";
@@ -54,6 +55,7 @@ export function ShipDetailCard({
   showClose = true,
   onAcknowledgeAlert,
   commandFooter,
+  captainBridgeFooter,
 }: {
   ship: ShipDetail;
   onClose: () => void;
@@ -62,6 +64,8 @@ export function ShipDetailCard({
   onAcknowledgeAlert?: (alertId: string) => void;
   /** Extra actions for command (e.g. send order to captain). */
   commandFooter?: React.ReactNode;
+  /** Captain-only: distress / bridge actions. */
+  captainBridgeFooter?: React.ReactNode;
 }) {
   const destTitle =
     ship.destination_port_name && ship.destination_port_id
@@ -235,6 +239,12 @@ export function ShipDetailCard({
         {commandFooter ? (
           <div className="rounded-xl border border-cyan-400/20 bg-cyan-950/20 px-3 py-3">
             {commandFooter}
+          </div>
+        ) : null}
+
+        {captainBridgeFooter ? (
+          <div className="rounded-xl border border-rose-400/25 bg-rose-950/25 px-3 py-3">
+            {captainBridgeFooter}
           </div>
         ) : null}
       </div>

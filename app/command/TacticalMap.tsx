@@ -15,7 +15,14 @@ import {
   Waves,
   X,
 } from "lucide-react";
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import {
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  type ReactNode,
+} from "react";
 import maplibregl, { GeoJSONSource, LngLatBoundsLike, Map as MlMap } from "maplibre-gl";
 import "maplibre-gl/dist/maplibre-gl.css";
 
@@ -23,12 +30,25 @@ import type { AppRole } from "@/app/lib/authRole";
 import { CaptainOrdersPanel } from "@/components/CaptainOrdersPanel";
 import { CommandRejectionInbox } from "@/components/CommandRejectionInbox";
 import { SendCaptainOrderModal } from "@/components/SendCaptainOrderModal";
+import { captainDeclareDistress } from "@/app/lib/captainDistress";
 import {
   createCriticalCaptainOrder,
   isShipCriticallyDistressed,
 } from "@/app/lib/directiveOrders";
-import { AO_BOUNDS, NAVIGABLE_WATER_LATLNG } from "@/lib/fleetConfig";
-import { geographyToMapGeometry, parseLineString, parsePoint } from "@/lib/geo";
+import {
+  AO_BOUNDS,
+  CAPTAIN_LOW_FUEL_DISTRESS_TONS,
+  CAPTAIN_LOW_FUEL_RESET_HYSTERESIS,
+  NAVIGABLE_WATER_LATLNG,
+} from "@/lib/fleetConfig";
+import { geographyToMapGeometry, parsePoint } from "@/lib/geo";
+import {
+  initialBearingDeg,
+  steerPreviewLngLat,
+  steerTowardPortWithCommitment,
+  type SteerCommitment,
+} from "@/lib/pathMotion";
+import { mpsFromKnots } from "@/lib/kinematics";
 import { supabase } from "@/lib/supabaseClient";
 import { playTacticalChirp } from "@/lib/tacticalAudio";
 import {
@@ -41,6 +61,15 @@ import {
   ZONE_GRID_STEP_DEG,
   type ZoneCellKey,
 } from "@/lib/zoneArchitect";
+import {
+  haversineM,
+  pointInAnyObstacle,
+  pointInNavigableFree,
+  pointInPolygon,
+  snapLatLngIntoFreeWater,
+  snapLatLngIntoWater,
+  type ObstacleRings,
+} from "@/lib/waterRouting";
 
 import { ShipDetailCard, type ShipDetail } from "./ui/ShipDetailCard";
 
@@ -54,6 +83,8 @@ export type TacticalMapProps = {
   /** Logged-in user id (command) — required to send directives & review refusals. */
   commandUserId?: string | null;
   captainUserId?: string | null;
+  /** Extra controls above Zone Architect (e.g. Threats launcher). */
+  leadingRail?: ReactNode;
 };
 
 type ShipMetaRow = {
@@ -101,6 +132,25 @@ function clamp(n: number, min: number, max: number) {
   return Math.max(min, Math.min(max, n));
 }
 
+function ringsFromRestrictedZoneFeatures(
+  feats: GeoJSON.Feature<GeoJSON.Polygon | GeoJSON.MultiPolygon>[]
+): ObstacleRings {
+  const rings: ObstacleRings = [];
+  for (const f of feats) {
+    const g = f.geometry;
+    if (g.type === "Polygon") {
+      const outer = g.coordinates[0];
+      rings.push(outer.map(([lng, lat]) => [lat, lng] as [number, number]));
+    } else {
+      for (const poly of g.coordinates) {
+        const outer = poly[0];
+        rings.push(outer.map(([lng, lat]) => [lat, lng] as [number, number]));
+      }
+    }
+  }
+  return rings;
+}
+
 function formatSupabaseLikeError(err: unknown): string {
   if (err == null) return "Unknown error";
   if (typeof err === "string") return err;
@@ -121,40 +171,6 @@ function formatSupabaseLikeError(err: unknown): string {
   }
 }
 
-function mpsFromKnots(knots: number) {
-  return (knots * 1852) / 3600;
-}
-
-function advanceLatLng({
-  lat,
-  lng,
-  headingDeg,
-  distanceM,
-}: {
-  lat: number;
-  lng: number;
-  headingDeg: number;
-  distanceM: number;
-}) {
-  const R = 6378137;
-  const brng = (headingDeg * Math.PI) / 180;
-  const lat1 = (lat * Math.PI) / 180;
-  const lng1 = (lng * Math.PI) / 180;
-
-  const lat2 = Math.asin(
-    Math.sin(lat1) * Math.cos(distanceM / R) +
-      Math.cos(lat1) * Math.sin(distanceM / R) * Math.cos(brng)
-  );
-  const lng2 =
-    lng1 +
-    Math.atan2(
-      Math.sin(brng) * Math.sin(distanceM / R) * Math.cos(lat1),
-      Math.cos(distanceM / R) - Math.sin(lat1) * Math.sin(lat2)
-    );
-
-  return { lat: (lat2 * 180) / Math.PI, lng: (lng2 * 180) / Math.PI };
-}
-
 type ShipFix = {
   ship_id: string;
   tsMs: number;
@@ -168,9 +184,24 @@ type ShipFix = {
 
 function shipTone(status: string, speedKnots: number) {
   if (status === "distressed") return { fill: "#ef4444", stroke: "rgba(255,255,255,0.85)" };
+  if (status === "insufficient_fuel" || status === "out_of_fuel")
+    return { fill: "#f97316", stroke: "rgba(255,255,255,0.85)" };
+  if (status === "stranded") return { fill: "#dc2626", stroke: "rgba(255,255,255,0.8)" };
   if (status === "rerouting") return { fill: "#f59e0b", stroke: "rgba(255,255,255,0.8)" };
+  if (status === "stopped") return { fill: "#64748b", stroke: "rgba(255,255,255,0.55)" };
   if (speedKnots >= 15) return { fill: "#22c55e", stroke: "rgba(255,255,255,0.8)" };
   return { fill: "#38bdf8", stroke: "rgba(255,255,255,0.75)" };
+}
+
+function shipMarkerInnerHtml(headingDeg: number, fill: string, stroke: string) {
+  return `
+    <div style="width:34px;height:34px;transform:rotate(${headingDeg}deg);transform-origin:50% 50%;">
+      <svg width="34" height="34" viewBox="0 0 64 64" xmlns="http://www.w3.org/2000/svg">
+        <path d="M32 6 C38 14 43 24 46 36 L52 56 L32 50 L12 56 L18 36 C21 24 26 14 32 6 Z"
+          fill="${fill}" stroke="${stroke}" stroke-width="2.8" stroke-linejoin="round"/>
+        <path d="M32 10 L32 48" stroke="rgba(0,0,0,0.25)" stroke-width="2" stroke-linecap="round"/>
+      </svg>
+    </div>`;
 }
 
 function createShipMarkerElement({
@@ -178,13 +209,17 @@ function createShipMarkerElement({
   headingDeg,
   status,
   speedKnots,
+  yielding,
 }: {
   shipId: string;
   headingDeg: number;
   status: string;
   speedKnots: number;
+  yielding?: boolean;
 }) {
-  const { fill, stroke } = shipTone(status, speedKnots);
+  const tone = yielding
+    ? { fill: "#475569", stroke: "rgba(255,255,255,0.5)" }
+    : shipTone(status, speedKnots);
   const wrap = document.createElement("button");
   wrap.type = "button";
   wrap.setAttribute("aria-label", `Select ship ${shipId}`);
@@ -196,14 +231,7 @@ function createShipMarkerElement({
   wrap.style.padding = "0";
   wrap.style.cursor = "pointer";
 
-  wrap.innerHTML = `
-    <div style="width:34px;height:34px;transform:rotate(${headingDeg}deg);transform-origin:50% 50%;">
-      <svg width="34" height="34" viewBox="0 0 64 64" xmlns="http://www.w3.org/2000/svg">
-        <path d="M32 6 C38 14 43 24 46 36 L52 56 L32 50 L12 56 L18 36 C21 24 26 14 32 6 Z"
-          fill="${fill}" stroke="${stroke}" stroke-width="2.8" stroke-linejoin="round"/>
-        <path d="M32 10 L32 48" stroke="rgba(0,0,0,0.25)" stroke-width="2" stroke-linecap="round"/>
-      </svg>
-    </div>`;
+  wrap.innerHTML = shipMarkerInnerHtml(headingDeg, tone.fill, tone.stroke);
 
   return {
     el: wrap,
@@ -214,10 +242,51 @@ function createShipMarkerElement({
   };
 }
 
+function updateShipMarkerAppearance(
+  wrap: HTMLElement,
+  headingDeg: number,
+  status: string,
+  speedKnots: number,
+  yielding: boolean
+) {
+  const tone = yielding
+    ? { fill: "#475569", stroke: "rgba(255,255,255,0.5)" }
+    : shipTone(status, speedKnots);
+  wrap.innerHTML = shipMarkerInnerHtml(headingDeg, tone.fill, tone.stroke);
+}
+
 const bounds: LngLatBoundsLike = [
   [AO_BOUNDS[0][0], AO_BOUNDS[0][1]],
   [AO_BOUNDS[1][0], AO_BOUNDS[1][1]],
 ];
+
+const PROXIMITY_IN_M = 800;
+const PROXIMITY_OUT_M = 1300;
+const ARB_INTERVAL_MS = 450;
+const PROXIMITY_ARB_ENABLED = process.env.NEXT_PUBLIC_ENABLE_PROXIMITY_ARB === "true";
+const POSITION_SYNC_MS = 800;
+const SIM_SPEED_MULTIPLIER = Math.max(
+  1,
+  Number.parseFloat(process.env.NEXT_PUBLIC_SIM_SPEED_MULT ?? "5000") || 5000
+);
+
+const PAIRWISE_SLOW_CLOSE_M = 700;
+const PAIRWISE_SLOW_CLEAR_M = 4200;
+
+function pairwiseProximitySpeedFactor(nearestNeighborM: number): number {
+  if (nearestNeighborM >= PAIRWISE_SLOW_CLEAR_M) return 1;
+  if (nearestNeighborM <= PAIRWISE_SLOW_CLOSE_M) return 0.3;
+  const t =
+    (nearestNeighborM - PAIRWISE_SLOW_CLOSE_M) /
+    (PAIRWISE_SLOW_CLEAR_M - PAIRWISE_SLOW_CLOSE_M);
+  const s = t * t * (3 - 2 * t);
+  return 0.3 + 0.7 * s;
+}
+
+function pickStandOnShip(ida: string, fa: ShipFix, idb: string, fb: ShipFix): string {
+  if (fa.speed_knots !== fb.speed_knots) return fa.speed_knots > fb.speed_knots ? ida : idb;
+  return ida < idb ? ida : idb;
+}
 
 export default function TacticalMap({
   mode = "command",
@@ -226,6 +295,7 @@ export default function TacticalMap({
   captainDisplayName = null,
   commandUserId = null,
   captainUserId = null,
+  leadingRail = null,
 }: TacticalMapProps) {
   const isCaptain = mode === "captain" && Boolean(captainShipId);
   const isCommand = mode === "command";
@@ -237,13 +307,28 @@ export default function TacticalMap({
   const markersRef = useRef<
     Record<
       string,
-      { marker: maplibregl.Marker; setHeading: (deg: number) => void; lastHeading: number }
+      {
+        marker: maplibregl.Marker;
+        setHeading: (deg: number) => void;
+        lastHeading: number;
+        lastYielding?: boolean;
+      }
     >
   >({});
 
   const fixesRef = useRef<Record<string, ShipFix>>({});
   const renderPosRef = useRef<Record<string, { lng: number; lat: number }>>({});
   const metaRef = useRef<Record<string, ShipMetaRow>>({});
+
+  const simHeadingRef = useRef<Record<string, number>>({});
+  const steerCommitRef = useRef<Record<string, SteerCommitment>>({});
+  const lastRafMsRef = useRef<number | null>(null);
+  const lastPosSyncMsRef = useRef(0);
+  const yieldPartnersRef = useRef<Map<string, Set<string>>>(new Map());
+  const arbitrationSavedRef = useRef<Map<string, { speed: number; status: string }>>(new Map());
+  const lastArbMsRef = useRef(0);
+  const restrictedZoneRingsRef = useRef<ObstacleRings>([]);
+  const captainAutoDistressRef = useRef({ fuel: false, zone: false });
 
   const clippedCellCacheRef = useRef<ClippedCellCache>(new Map());
   const navPolygonRef = useRef(navigableLngLatPolygon());
@@ -277,6 +362,8 @@ export default function TacticalMap({
   const [zoneDeactivateBusyId, setZoneDeactivateBusyId] = useState<string | null>(null);
   const [zoneToast, setZoneToast] = useState<string | null>(null);
   const [committedZoneRows, setCommittedZoneRows] = useState<{ id: string; name: string }[]>([]);
+  const [captainDistressDraft, setCaptainDistressDraft] = useState("");
+  const [captainDistressBusy, setCaptainDistressBusy] = useState(false);
 
   const pulsePhaseRef = useRef(0);
 
@@ -316,10 +403,12 @@ export default function TacticalMap({
         geometry,
       });
     }
+    restrictedZoneRingsRef.current = ringsFromRestrictedZoneFeatures(feats);
     const fc: GeoJSON.FeatureCollection = { type: "FeatureCollection", features: feats };
     const map = mapRef.current;
     const src = map?.getSource("restricted-zones-active") as GeoJSONSource | undefined;
     if (src) src.setData(fc);
+    setDetailTick((t) => t + 1);
   }, []);
 
   const refreshRoutesFromDb = useCallback(async () => {
@@ -359,6 +448,17 @@ export default function TacticalMap({
     const destId = meta?.destination_port_id ?? null;
     const destPort = destId ? portById.get(destId) : undefined;
     const destPt = destPort ? parsePoint(destPort.position) : null;
+    const ring = NAVIGABLE_WATER_LATLNG as [number, number][];
+    const obstacles = restrictedZoneRingsRef.current;
+    const destSnap =
+      destPt && pointInPolygon({ lat: destPt.lat, lng: destPt.lng }, ring)
+        ? snapLatLngIntoFreeWater(
+            { lat: destPt.lat, lng: destPt.lng },
+            ring,
+            obstacles,
+            { lat: fix.lat, lng: fix.lng }
+          )
+        : null;
     const route = routesRef.current[selectedShipId] ?? null;
     const alertRows = alerts.filter(
       (a) => a.status === "active" && (a.ship_id ?? null) === selectedShipId
@@ -373,8 +473,8 @@ export default function TacticalMap({
       cargo_type: meta?.cargo_type ?? null,
       destination_port_id: destId,
       destination_port_name: destPort?.name ?? null,
-      destination_lat: destPt?.lat ?? null,
-      destination_lng: destPt?.lng ?? null,
+      destination_lat: destSnap?.lat ?? destPt?.lat ?? null,
+      destination_lng: destSnap?.lng ?? destPt?.lng ?? null,
       route_is_valid: route?.is_valid ?? null,
       route_distance_m: route?.distance_m ?? null,
       route_fuel_estimate_tons: route?.fuel_estimate_tons ?? null,
@@ -579,6 +679,22 @@ export default function TacticalMap({
         },
       });
 
+      map.addSource("all-routes", {
+        type: "geojson",
+        data: { type: "FeatureCollection", features: [] },
+      });
+      map.addLayer({
+        id: "all-routes-line",
+        type: "line",
+        source: "all-routes",
+        paint: {
+          "line-color": "#7dd3fc",
+          "line-opacity": 0.45,
+          "line-dasharray": [2, 3],
+          "line-width": 1.5,
+        },
+      });
+
       map.addSource("selected-route", {
         type: "geojson",
         data: { type: "FeatureCollection", features: [] },
@@ -656,14 +772,16 @@ export default function TacticalMap({
         if (cancelled) return;
         setPorts(portsParsed);
 
+        const snapRing = NAVIGABLE_WATER_LATLNG as [number, number][];
         const features: GeoJSON.Feature<GeoJSON.Point>[] = [];
         for (const row of portsParsed) {
           const p = parsePoint(row.position);
           if (!p) continue;
+          const snapped = snapLatLngIntoWater({ lat: p.lat, lng: p.lng }, snapRing);
           features.push({
             type: "Feature",
             properties: { id: row.id, name: row.name },
-            geometry: { type: "Point", coordinates: [p.lng, p.lat] },
+            geometry: { type: "Point", coordinates: [snapped.lng, snapped.lat] },
           });
         }
         ensurePortsLayer({ type: "FeatureCollection", features });
@@ -725,6 +843,17 @@ export default function TacticalMap({
             .limit(24);
           if (alertsRes.error) throw alertsRes.error;
           if (!cancelled) setAlerts((alertsRes.data ?? []) as AlertRow[]);
+        } else if (captainShipId) {
+          const capAlerts = await supabase
+            .from("alerts")
+            .select("id,title,severity,created_at,status,ship_id,type")
+            .eq("status", "active")
+            .eq("ship_id", captainShipId)
+            .order("severity", { ascending: false })
+            .order("created_at", { ascending: false })
+            .limit(24);
+          if (capAlerts.error) throw capAlerts.error;
+          if (!cancelled) setAlerts((capAlerts.data ?? []) as AlertRow[]);
         } else if (!cancelled) {
           setAlerts([]);
         }
@@ -759,11 +888,13 @@ export default function TacticalMap({
         if (isCaptain && captainShipId && sid !== captainShipId) return;
         const p = parsePoint(row.position);
         if (!p) return;
+        const ringRt = NAVIGABLE_WATER_LATLNG as [number, number][];
+        const snapped = snapLatLngIntoWater({ lat: p.lat, lng: p.lng }, ringRt);
         fixesRef.current[sid] = {
           ship_id: sid,
           tsMs: new Date(row.ts as string).getTime(),
-          lng: p.lng,
-          lat: p.lat,
+          lng: snapped.lng,
+          lat: snapped.lat,
           heading_deg: row.heading_deg as number,
           speed_knots: row.speed_knots as number,
           fuel_tons: (row.fuel_tons as number | null) ?? null,
@@ -812,6 +943,44 @@ export default function TacticalMap({
       supabase.removeChannel(channel);
     };
   }, [isCaptain]);
+
+  useEffect(() => {
+    if (!isCaptain || !captainShipId) return;
+
+    async function loadCaptainAlerts() {
+      const alertsRes = await supabase
+        .from("alerts")
+        .select("id,title,severity,created_at,status,ship_id,type")
+        .eq("status", "active")
+        .eq("ship_id", captainShipId)
+        .order("severity", { ascending: false })
+        .order("created_at", { ascending: false })
+        .limit(24);
+      if (!alertsRes.error) setAlerts((alertsRes.data ?? []) as AlertRow[]);
+    }
+
+    void loadCaptainAlerts();
+
+    const channel = supabase
+      .channel(`captain_alerts_${captainShipId}`)
+      .on(
+        "postgres_changes",
+        {
+          event: "*",
+          schema: "public",
+          table: "alerts",
+          filter: `ship_id=eq.${captainShipId}`,
+        },
+        () => {
+          void loadCaptainAlerts();
+        }
+      )
+      .subscribe();
+
+    return () => {
+      void supabase.removeChannel(channel);
+    };
+  }, [isCaptain, captainShipId]);
 
   // Realtime overlays: committed zones + route replans for path styling
   useEffect(() => {
@@ -976,6 +1145,48 @@ export default function TacticalMap({
     setDetailTick((t) => t + 1);
   }, []);
 
+  const submitCaptainManualDistress = useCallback(async () => {
+    if (!captainShipId) return;
+    const msg = captainDistressDraft.trim();
+    if (!msg) {
+      setZoneToast("Describe the situation for command (required).");
+      window.setTimeout(() => setZoneToast(null), 4000);
+      return;
+    }
+    setCaptainDistressBusy(true);
+    setZoneToast(null);
+    try {
+      await captainDeclareDistress(supabase, {
+        shipId: captainShipId,
+        reason: "manual",
+        message: msg,
+      });
+      setCaptainDistressDraft("");
+      setDetailTick((t) => t + 1);
+      setZoneToast("Distress call sent to command.");
+      window.setTimeout(() => setZoneToast(null), 4000);
+      const alertsRes = await supabase
+        .from("alerts")
+        .select("id,title,severity,created_at,status,ship_id,type")
+        .eq("status", "active")
+        .eq("ship_id", captainShipId)
+        .order("severity", { ascending: false })
+        .order("created_at", { ascending: false })
+        .limit(24);
+      if (!alertsRes.error) setAlerts((alertsRes.data ?? []) as AlertRow[]);
+    } catch (e: unknown) {
+      let errMsg = formatSupabaseLikeError(e);
+      if (/could not find|does not exist|404/i.test(errMsg)) {
+        errMsg +=
+          " Apply migration 0021_captain_declare_distress.sql (captain_declare_distress RPC).";
+      }
+      setZoneToast(errMsg);
+      window.setTimeout(() => setZoneToast(null), 8000);
+    } finally {
+      setCaptainDistressBusy(false);
+    }
+  }, [captainShipId, captainDistressDraft]);
+
   const commitZoneSelection = useCallback(async () => {
     if (selectedZoneCellsRef.current.size === 0) return;
     setZoneCommitBusy(true);
@@ -1058,7 +1269,7 @@ export default function TacticalMap({
     void refreshZonesFromDb();
   }, [dataState, refreshZonesFromDb]);
 
-  // RAF smoothing + marker management + distress pulse
+  // RAF: water + restricted-zone-aware steering, route previews, proximity arbitration
   useEffect(() => {
     let raf = 0;
     const tick = () => {
@@ -1070,30 +1281,391 @@ export default function TacticalMap({
         let distress = 0;
         const nextDistress = new Set<string>();
 
-        for (const [shipId, fix] of Object.entries(fixesRef.current)) {
-          const dtS = clamp((now - fix.tsMs) / 1000, 0, 1.25);
-          const distanceM = mpsFromKnots(clamp(fix.speed_knots, 0, 40)) * dtS;
-          const adv = advanceLatLng({
-            lat: fix.lat,
-            lng: fix.lng,
-            headingDeg: fix.heading_deg,
-            distanceM,
-          });
-          renderPosRef.current[shipId] = { lng: adv.lng, lat: adv.lat };
+        const ringPoly = NAVIGABLE_WATER_LATLNG as [number, number][];
+        const obstacles = restrictedZoneRingsRef.current;
+        const lastMs = lastRafMsRef.current ?? now;
+        const dt = Math.min((now - lastMs) / 1000, 0.12);
+        lastRafMsRef.current = now;
 
-          if (fix.status === "distressed") distress += 1;
-          else if (fix.status === "rerouting") warning += 1;
+        const prevPositions: Record<string, { lat: number; lng: number }> = {};
+        for (const sid of Object.keys(fixesRef.current)) {
+          const f = fixesRef.current[sid];
+          prevPositions[sid] = renderPosRef.current[sid] ?? { lng: f.lng, lat: f.lat };
+        }
+        const nearestNeighborM = (sid: string): number => {
+          const p = prevPositions[sid];
+          if (!p) return Infinity;
+          let best = Infinity;
+          for (const [other, q] of Object.entries(prevPositions)) {
+            if (other === sid) continue;
+            const d = haversineM(
+              { lat: p.lat, lng: p.lng },
+              { lat: q.lat, lng: q.lng }
+            );
+            if (d < best) best = d;
+          }
+          return best;
+        };
+
+        for (const [shipId, fix] of Object.entries(fixesRef.current)) {
+          const speedKn = fix.speed_knots;
+          const isHalted =
+            fix.status === "stopped" ||
+            fix.status === "distressed" ||
+            fix.status === "stranded" ||
+            fix.status === "insufficient_fuel" ||
+            fix.status === "out_of_fuel" ||
+            speedKn < 0.05;
+          const prevRender =
+            renderPosRef.current[shipId] ?? { lng: fix.lng, lat: fix.lat };
+
+          const baseTravelM =
+            mpsFromKnots(clamp(speedKn, 0, 40)) * dt * SIM_SPEED_MULTIPLIER;
+          const travelM =
+            baseTravelM * pairwiseProximitySpeedFactor(nearestNeighborM(shipId));
+
+          if (!isHalted && dataState === "ready") {
+            const meta = metaRef.current[shipId];
+            const destId = meta?.destination_port_id;
+            const destPort = destId ? portById.get(destId) : undefined;
+            const destPt = destPort ? parsePoint(destPort.position) : null;
+            let cur = prevRender;
+            if (!pointInPolygon({ lat: cur.lat, lng: cur.lng }, ringPoly)) {
+              cur = snapLatLngIntoWater({ lat: cur.lat, lng: cur.lng }, ringPoly);
+            }
+            if (!pointInNavigableFree({ lat: cur.lat, lng: cur.lng }, ringPoly, obstacles)) {
+              cur = snapLatLngIntoFreeWater(
+                { lat: cur.lat, lng: cur.lng },
+                ringPoly,
+                obstacles,
+                { lat: fix.lat, lng: fix.lng }
+              );
+            }
+            if (destPt) {
+              const destInWater = snapLatLngIntoFreeWater(
+                { lat: destPt.lat, lng: destPt.lng },
+                ringPoly,
+                obstacles,
+                { lat: cur.lat, lng: cur.lng }
+              );
+              const destKey = destId ?? null;
+              if (!steerCommitRef.current[shipId]) {
+                steerCommitRef.current[shipId] = {
+                  destinationPortId: null,
+                  committedBearingDeg: null,
+                };
+              }
+              const st = steerCommitRef.current[shipId];
+              if (st.destinationPortId !== destKey) {
+                st.destinationPortId = destKey;
+                st.committedBearingDeg = null;
+              }
+              const step = steerTowardPortWithCommitment(
+                { lat: cur.lat, lng: cur.lng },
+                destInWater,
+                travelM,
+                ringPoly,
+                st,
+                obstacles
+              );
+              simHeadingRef.current[shipId] = step.bearingDeg;
+              renderPosRef.current[shipId] = {
+                lng: step.position.lng,
+                lat: step.position.lat,
+              };
+            } else {
+              delete steerCommitRef.current[shipId];
+              renderPosRef.current[shipId] = cur;
+            }
+          } else {
+            renderPosRef.current[shipId] = prevRender;
+            delete steerCommitRef.current[shipId];
+          }
+
+          if (
+            fix.status === "distressed" ||
+            fix.status === "stranded" ||
+            fix.status === "insufficient_fuel" ||
+            fix.status === "out_of_fuel"
+          ) {
+            distress += 1;
+          } else if (fix.status === "rerouting") warning += 1;
           else normal += 1;
 
-          if (fix.status === "distressed" || (fix.fuel_tons ?? 999999) < 1000) nextDistress.add(shipId);
+          if (
+            fix.status === "distressed" ||
+            fix.status === "stranded" ||
+            fix.status === "insufficient_fuel" ||
+            fix.status === "out_of_fuel" ||
+            (fix.fuel_tons ?? 999999) < CAPTAIN_LOW_FUEL_DISTRESS_TONS
+          ) {
+            nextDistress.add(shipId);
+          }
+        }
 
+        if (isCaptain && captainShipId && dataState === "ready") {
+          const fix = fixesRef.current[captainShipId];
+          const pos = renderPosRef.current[captainShipId];
+          if (fix && pos) {
+            const fuel = fix.fuel_tons ?? Number.POSITIVE_INFINITY;
+            if (fuel <= CAPTAIN_LOW_FUEL_DISTRESS_TONS) {
+              if (!captainAutoDistressRef.current.fuel) {
+                captainAutoDistressRef.current.fuel = true;
+                void (async () => {
+                  try {
+                    await captainDeclareDistress(supabase, {
+                      shipId: captainShipId,
+                      reason: "low_fuel",
+                      message: `Automatic distress: fuel at or below ${CAPTAIN_LOW_FUEL_DISTRESS_TONS} t (fleet.json operationalRules).`,
+                    });
+                    setDetailTick((t) => t + 1);
+                    const alertsRes = await supabase
+                      .from("alerts")
+                      .select("id,title,severity,created_at,status,ship_id,type")
+                      .eq("status", "active")
+                      .eq("ship_id", captainShipId)
+                      .order("severity", { ascending: false })
+                      .order("created_at", { ascending: false })
+                      .limit(24);
+                    if (!alertsRes.error) setAlerts((alertsRes.data ?? []) as AlertRow[]);
+                  } catch (e: unknown) {
+                    setZoneToast(formatSupabaseLikeError(e));
+                    window.setTimeout(() => setZoneToast(null), 6000);
+                  }
+                })();
+              }
+            } else if (fuel > CAPTAIN_LOW_FUEL_DISTRESS_TONS * CAPTAIN_LOW_FUEL_RESET_HYSTERESIS) {
+              captainAutoDistressRef.current.fuel = false;
+            }
+
+            const obs = restrictedZoneRingsRef.current;
+            if (
+              obs.length > 0 &&
+              pointInAnyObstacle({ lat: pos.lat, lng: pos.lng }, obs)
+            ) {
+              if (!captainAutoDistressRef.current.zone) {
+                captainAutoDistressRef.current.zone = true;
+                void (async () => {
+                  try {
+                    await captainDeclareDistress(supabase, {
+                      shipId: captainShipId,
+                      reason: "restricted_zone",
+                      message:
+                        "Automatic distress: vessel position is inside an active command restricted zone.",
+                    });
+                    setDetailTick((t) => t + 1);
+                    const alertsRes = await supabase
+                      .from("alerts")
+                      .select("id,title,severity,created_at,status,ship_id,type")
+                      .eq("status", "active")
+                      .eq("ship_id", captainShipId)
+                      .order("severity", { ascending: false })
+                      .order("created_at", { ascending: false })
+                      .limit(24);
+                    if (!alertsRes.error) setAlerts((alertsRes.data ?? []) as AlertRow[]);
+                  } catch (e: unknown) {
+                    setZoneToast(formatSupabaseLikeError(e));
+                    window.setTimeout(() => setZoneToast(null), 6000);
+                  }
+                })();
+              }
+            } else {
+              captainAutoDistressRef.current.zone = false;
+            }
+          }
+        }
+
+        const allRoutesSource = map.getSource("all-routes") as GeoJSONSource | undefined;
+        if (allRoutesSource && dataState === "ready") {
+          const routeFeatures: GeoJSON.Feature[] = [];
+          for (const shipId of Object.keys(fixesRef.current)) {
+            const shipPos = renderPosRef.current[shipId];
+            if (!shipPos) continue;
+            const meta = metaRef.current[shipId];
+            const destId = meta?.destination_port_id;
+            const destPort = destId ? portById.get(destId) : undefined;
+            const destPt = destPort ? parsePoint(destPort.position) : null;
+            if (!destPt) continue;
+            const destSnap = snapLatLngIntoFreeWater(
+              { lat: destPt.lat, lng: destPt.lng },
+              ringPoly,
+              obstacles,
+              { lat: shipPos.lat, lng: shipPos.lng }
+            );
+            const hdg =
+              simHeadingRef.current[shipId] ??
+              initialBearingDeg(
+                { lat: shipPos.lat, lng: shipPos.lng },
+                destSnap
+              );
+            const coords = steerPreviewLngLat(
+              { lat: shipPos.lat, lng: shipPos.lng },
+              hdg,
+              destSnap,
+              ringPoly,
+              obstacles
+            );
+            routeFeatures.push({
+              type: "Feature",
+              properties: { shipId },
+              geometry: { type: "LineString", coordinates: coords },
+            });
+          }
+          allRoutesSource.setData({ type: "FeatureCollection", features: routeFeatures });
+        } else if (allRoutesSource) {
+          allRoutesSource.setData({ type: "FeatureCollection", features: [] });
+        }
+
+        const pos = renderPosRef.current;
+        if (
+          !isCaptain &&
+          PROXIMITY_ARB_ENABLED &&
+          now - lastArbMsRef.current >= ARB_INTERVAL_MS
+        ) {
+          lastArbMsRef.current = now;
+          const ids = Object.keys(fixesRef.current);
+
+          for (let i = 0; i < ids.length; i++) {
+            for (let j = i + 1; j < ids.length; j++) {
+              const ida = ids[i];
+              const idb = ids[j];
+              const pa = pos[ida];
+              const pb = pos[idb];
+              if (!pa || !pb) continue;
+              const fa = fixesRef.current[ida];
+              const fb = fixesRef.current[idb];
+              if (!fa || !fb) continue;
+              if (
+                fa.status === "distressed" ||
+                fb.status === "distressed" ||
+                fa.status === "insufficient_fuel" ||
+                fb.status === "insufficient_fuel" ||
+                fa.status === "stranded" ||
+                fb.status === "stranded"
+              ) {
+                continue;
+              }
+
+              const d = haversineM(
+                { lat: pa.lat, lng: pa.lng },
+                { lat: pb.lat, lng: pb.lng }
+              );
+
+              if (d < PROXIMITY_IN_M) {
+                const winner = pickStandOnShip(ida, fa, idb, fb);
+                const loser = winner === ida ? idb : ida;
+                let partners = yieldPartnersRef.current.get(loser);
+                if (!partners) {
+                  partners = new Set<string>();
+                  yieldPartnersRef.current.set(loser, partners);
+                }
+                if (!partners.has(winner)) {
+                  partners.add(winner);
+                  if (!arbitrationSavedRef.current.has(loser)) {
+                    const fl = fixesRef.current[loser];
+                    arbitrationSavedRef.current.set(loser, {
+                      speed: fl.speed_knots,
+                      status: fl.status,
+                    });
+                  }
+                  fixesRef.current[loser] = {
+                    ...fixesRef.current[loser],
+                    status: "stopped",
+                    speed_knots: 0,
+                  };
+                  void supabase
+                    .from("ship_state_current")
+                    .update({
+                      status: "stopped",
+                      speed_knots: 0,
+                      ts: new Date().toISOString(),
+                      extra: { arbitration_yield_to: winner },
+                    })
+                    .eq("ship_id", loser);
+                  void supabase.from("alerts").insert({
+                    type: "proximity_warning",
+                    severity: 3,
+                    title: `Proximity: ${loser} yielding to ${winner}`,
+                    source: "command_ui",
+                    ship_id: loser,
+                    related_ship_id: winner,
+                    payload: { distance_m: Math.round(d) },
+                  });
+                  setDetailTick((t) => t + 1);
+                }
+              }
+
+              if (d > PROXIMITY_OUT_M) {
+                const tryClearPair = (loser: string, winner: string) => {
+                  const ps = yieldPartnersRef.current.get(loser);
+                  if (!ps?.has(winner)) return;
+                  ps.delete(winner);
+                  if (ps.size === 0) {
+                    yieldPartnersRef.current.delete(loser);
+                    const saved = arbitrationSavedRef.current.get(loser);
+                    arbitrationSavedRef.current.delete(loser);
+                    if (saved && fixesRef.current[loser]) {
+                      fixesRef.current[loser] = {
+                        ...fixesRef.current[loser],
+                        status: saved.status,
+                        speed_knots: saved.speed,
+                      };
+                      void supabase
+                        .from("ship_state_current")
+                        .update({
+                          status: saved.status,
+                          speed_knots: saved.speed,
+                          ts: new Date().toISOString(),
+                          extra: {},
+                        })
+                        .eq("ship_id", loser);
+                      setDetailTick((t) => t + 1);
+                    }
+                  }
+                };
+                tryClearPair(ida, idb);
+                tryClearPair(idb, ida);
+              }
+            }
+          }
+        }
+
+        if (!isCaptain && now - lastPosSyncMsRef.current >= POSITION_SYNC_MS) {
+          lastPosSyncMsRef.current = now;
+          for (const shipId of Object.keys(fixesRef.current)) {
+            const fix = fixesRef.current[shipId];
+            if (fix.status === "stopped") continue;
+            const r = renderPosRef.current[shipId];
+            if (!r) continue;
+            void supabase
+              .from("ship_state_current")
+              .update({
+                position: { type: "Point", coordinates: [r.lng, r.lat] },
+                ts: new Date().toISOString(),
+              })
+              .eq("ship_id", shipId);
+          }
+        }
+
+        const yieldingShips = new Set<string>();
+        yieldPartnersRef.current.forEach((partners, loser) => {
+          if (partners.size > 0) yieldingShips.add(loser);
+        });
+
+        for (const [shipId, fix] of Object.entries(fixesRef.current)) {
+          const adv = renderPosRef.current[shipId];
+          if (!adv) continue;
+
+          const yielding = yieldingShips.has(shipId);
+          const hdg = simHeadingRef.current[shipId] ?? fix.heading_deg;
           let m = markersRef.current[shipId];
           if (!m) {
             const { el, setHeading } = createShipMarkerElement({
               shipId,
-              headingDeg: fix.heading_deg,
+              headingDeg: hdg,
               status: fix.status,
               speedKnots: fix.speed_knots,
+              yielding,
             });
             el.addEventListener("click", () => setSelectedShipId(shipId));
             el.addEventListener("mouseenter", () => {
@@ -1118,12 +1690,27 @@ export default function TacticalMap({
             const marker = new maplibregl.Marker({ element: el, anchor: "center" })
               .setLngLat([adv.lng, adv.lat])
               .addTo(map);
-            m = markersRef.current[shipId] = { marker, setHeading, lastHeading: fix.heading_deg };
+            m = markersRef.current[shipId] = {
+              marker,
+              setHeading,
+              lastHeading: hdg,
+              lastYielding: yielding,
+            };
           } else {
             m.marker.setLngLat([adv.lng, adv.lat]);
-            if (Math.abs(m.lastHeading - fix.heading_deg) > 0.1) {
-              m.setHeading(fix.heading_deg);
-              m.lastHeading = fix.heading_deg;
+            if (Math.abs(m.lastHeading - hdg) > 0.1) {
+              m.setHeading(hdg);
+              m.lastHeading = hdg;
+            }
+            if (m.lastYielding !== yielding) {
+              m.lastYielding = yielding;
+              updateShipMarkerAppearance(
+                m.marker.getElement(),
+                hdg,
+                fix.status,
+                fix.speed_knots,
+                yielding
+              );
             }
           }
         }
@@ -1138,13 +1725,13 @@ export default function TacticalMap({
           pulseSource.setData({
             type: "FeatureCollection",
             features: Array.from(nextDistress).map((shipId) => {
-              const pos = renderPosRef.current[shipId];
+              const p = renderPosRef.current[shipId];
               return {
                 type: "Feature" as const,
                 properties: {},
                 geometry: {
                   type: "Point" as const,
-                  coordinates: [pos.lng, pos.lat],
+                  coordinates: [p.lng, p.lat],
                 },
               };
             }),
@@ -1159,38 +1746,42 @@ export default function TacticalMap({
         }
 
         const routeSource = map.getSource("selected-route") as GeoJSONSource | undefined;
-        if (routeSource && selectedShipId) {
+        if (routeSource && selectedShipId && dataState === "ready") {
           const meta = metaRef.current[selectedShipId];
           const destId = meta?.destination_port_id;
           const destPort = destId ? portById.get(destId) : undefined;
           const destPos = destPort ? parsePoint(destPort.position) : null;
           const shipPos = renderPosRef.current[selectedShipId];
-
-          let coords: [number, number][] | null = null;
           const rr = routesRef.current[selectedShipId];
-          if (rr?.path_line) {
-            coords = parseLineString(rr.path_line);
-          }
           const invalid = !!(rr && rr.is_valid === false);
 
-          const lineGeom =
-            coords && coords.length > 1
-              ? coords
-              : shipPos && destPos
-                ? [
-                    [shipPos.lng, shipPos.lat] as [number, number],
-                    [destPos.lng, destPos.lat] as [number, number],
-                  ]
-                : null;
-
-          if (lineGeom) {
+          if (shipPos && destPos) {
+            const destSnap = snapLatLngIntoFreeWater(
+              { lat: destPos.lat, lng: destPos.lng },
+              ringPoly,
+              obstacles,
+              { lat: shipPos.lat, lng: shipPos.lng }
+            );
+            const hdg =
+              simHeadingRef.current[selectedShipId] ??
+              initialBearingDeg(
+                { lat: shipPos.lat, lng: shipPos.lng },
+                destSnap
+              );
+            const coords = steerPreviewLngLat(
+              { lat: shipPos.lat, lng: shipPos.lng },
+              hdg,
+              destSnap,
+              ringPoly,
+              obstacles
+            );
             routeSource.setData({
               type: "FeatureCollection",
               features: [
                 {
                   type: "Feature",
                   properties: {},
-                  geometry: { type: "LineString", coordinates: lineGeom },
+                  geometry: { type: "LineString", coordinates: coords },
                 },
               ],
             });
@@ -1203,7 +1794,7 @@ export default function TacticalMap({
               map.setPaintProperty(
                 "selected-route-line",
                 "line-dasharray",
-                invalid ? ([1.6, 1.6] as [number, number]) : ([10, 0.01] as [number, number])
+                invalid ? ([1.6, 1.6] as [number, number]) : ([2, 2] as [number, number])
               );
               map.setPaintProperty("selected-route-line", "line-color", invalid ? "#fcd34d" : "#93c5fd");
             } catch {
@@ -1217,7 +1808,7 @@ export default function TacticalMap({
     };
     raf = requestAnimationFrame(tick);
     return () => cancelAnimationFrame(raf);
-  }, [portById, selectedShipId, routesEpoch]);
+  }, [portById, selectedShipId, dataState, isCaptain, captainShipId]);
 
   useEffect(() => {
     const map = mapRef.current;
@@ -1254,33 +1845,36 @@ export default function TacticalMap({
         }}
       />
 
-      <div className="absolute left-4 top-1/2 z-20 -translate-y-1/2 space-y-3">
-        <button
-          type="button"
-          onClick={() => {
-            setZoneMode((prev) => {
-              if (prev) {
-                selectedZoneCellsRef.current.clear();
-                zonePaintActiveRef.current = false;
-                setSelectionCount(0);
-                setSelectionEpoch((e) => e + 1);
-              }
-              return !prev;
-            });
-          }}
-          aria-pressed={zoneMode}
-          aria-label={zoneMode ? "Exit Zone Architect" : "Zone Architect"}
-          className={`btn-glow flex h-11 w-11 cursor-pointer items-center justify-center rounded-full border border-white/20 text-cyan-100 backdrop-blur-md transition hover:bg-slate-800/75 ${
-            zoneMode ? "bg-amber-500/35 ring-2 ring-amber-200/55" : "bg-slate-900/70"
-          }`}
-        >
-          <Grid3x3 size={17} />
-        </button>
+      <div className="absolute left-4 top-1/2 z-20 flex -translate-y-1/2 flex-col gap-3">
+        {leadingRail}
+        {isCommand ? (
+          <button
+            type="button"
+            onClick={() => {
+              setZoneMode((prev) => {
+                if (prev) {
+                  selectedZoneCellsRef.current.clear();
+                  zonePaintActiveRef.current = false;
+                  setSelectionCount(0);
+                  setSelectionEpoch((e) => e + 1);
+                }
+                return !prev;
+              });
+            }}
+            aria-pressed={zoneMode}
+            aria-label={zoneMode ? "Exit Zone Architect" : "Zone Architect"}
+            className={`btn-glow flex h-11 w-11 shrink-0 cursor-pointer items-center justify-center rounded-full border border-white/20 text-cyan-100 backdrop-blur-md transition hover:bg-slate-800/75 ${
+              zoneMode ? "bg-amber-500/35 ring-2 ring-amber-200/55" : "bg-slate-900/70"
+            }`}
+          >
+            <Grid3x3 size={17} />
+          </button>
+        ) : null}
         {hudButtons.map((item) => (
           <button
             key={item.key}
             onClick={() => setHudPanel((prev) => (prev === item.key ? null : item.key))}
-            className="btn-glow flex h-11 w-11 cursor-pointer items-center justify-center rounded-full border border-white/20 bg-slate-900/70 text-cyan-100 backdrop-blur-md transition hover:bg-slate-800/75"
+            className="btn-glow flex h-11 w-11 shrink-0 cursor-pointer items-center justify-center rounded-full border border-white/20 bg-slate-900/70 text-cyan-100 backdrop-blur-md transition hover:bg-slate-800/75"
             aria-label={`${item.label} panel`}
           >
             <item.icon size={17} />
@@ -1432,7 +2026,7 @@ export default function TacticalMap({
                   ship={selectedShipDetail}
                   onClose={() => setSelectedShipId(null)}
                   showClose={!isCaptain}
-                  onAcknowledgeAlert={acknowledgeAlert}
+                  onAcknowledgeAlert={isCaptain ? undefined : acknowledgeAlert}
                   commandFooter={
                     isCommand && commandUserId && selectedShipDetail ? (
                       isShipCriticallyDistressed(selectedShipDetail.status) ? (
@@ -1455,6 +2049,45 @@ export default function TacticalMap({
                           <span className="text-white/70">distressed</span> (critical).
                         </p>
                       )
+                    ) : null
+                  }
+                  captainBridgeFooter={
+                    isCaptain && captainShipId && selectedShipDetail?.ship_id === captainShipId ? (
+                      <div className="space-y-3">
+                        {selectedShipDetail.fuel_tons != null &&
+                        selectedShipDetail.fuel_tons <= CAPTAIN_LOW_FUEL_DISTRESS_TONS ? (
+                          <p className="text-[10px] font-semibold leading-relaxed text-amber-200/95">
+                            Fuel is at or below the fleet threshold ({CAPTAIN_LOW_FUEL_DISTRESS_TONS}{" "}
+                            t). An automatic distress call is sent once; add details below if needed.
+                          </p>
+                        ) : null}
+                        <p className="text-[10px] leading-relaxed text-white/65">
+                          Send a distress call to Command. Your vessel status is updated so the
+                          operations floor can respond (orders, routing, tugs).
+                        </p>
+                        <textarea
+                          value={captainDistressDraft}
+                          onChange={(e) => setCaptainDistressDraft(e.target.value)}
+                          rows={3}
+                          placeholder="e.g. Main engine alarm — requesting instructions."
+                          className="w-full resize-y rounded-lg border border-white/15 bg-black/35 px-2 py-2 text-[11px] text-white placeholder:text-white/35"
+                        />
+                        <button
+                          type="button"
+                          disabled={captainDistressBusy}
+                          onClick={() => void submitCaptainManualDistress()}
+                          className="flex w-full items-center justify-center rounded-full bg-rose-600 py-2.5 text-xs font-bold text-white shadow-[0_8px_24px_rgba(225,29,72,0.35)] hover:bg-rose-500 disabled:pointer-events-none disabled:opacity-45"
+                        >
+                          {captainDistressBusy ? (
+                            <span className="inline-flex items-center justify-center gap-2">
+                              <Loader2 className="h-4 w-4 animate-spin" aria-hidden />
+                              Sending…
+                            </span>
+                          ) : (
+                            "Declare distress to Command"
+                          )}
+                        </button>
+                      </div>
                     ) : null
                   }
                 />
@@ -1524,12 +2157,23 @@ export default function TacticalMap({
                 <span className="h-2.5 w-2.5 rounded-full bg-amber-300" /> Rerouting
               </p>
               <p className="flex items-center gap-2">
-                <span className="h-2.5 w-2.5 rounded-full bg-red-400" /> Distressed
+                <span className="h-2.5 w-2.5 rounded-full bg-orange-500" /> Low fuel / critical
+              </p>
+              <p className="flex items-center gap-2">
+                <span className="h-2.5 w-2.5 rounded-full bg-red-400" /> Distressed / stranded
               </p>
             </div>
           </motion.div>
         ) : null}
       </AnimatePresence>
+
+      {zoneToast && !zoneMode ? (
+        <div className="pointer-events-none absolute left-1/2 top-16 z-[50] max-w-[min(92vw,420px)] -translate-x-1/2 px-3">
+          <p className="pointer-events-auto rounded-xl border border-amber-300/40 bg-amber-500/15 px-3 py-2 text-center text-[11px] leading-snug text-amber-50 shadow-lg backdrop-blur-md">
+            {zoneToast}
+          </p>
+        </div>
+      ) : null}
 
       <div className="pointer-events-none absolute left-1/2 top-4 z-10 max-w-[min(96vw,520px)] -translate-x-1/2 rounded-full border border-white/15 bg-slate-900/65 px-4 py-2 text-center text-xs text-white/80 backdrop-blur-md">
         <p className="flex flex-wrap items-center justify-center gap-2">

@@ -137,6 +137,106 @@ export function segmentInPolygon(a: LatLng, b: LatLng, ring: [number, number][])
   return true;
 }
 
+/** Closed rings [lat, lng][] — same convention as navigable water (`fleet.json`). */
+export type ObstacleRings = [number, number][][];
+
+export function pointInAnyObstacle(p: LatLng, obstacles: ObstacleRings): boolean {
+  for (const ring of obstacles) {
+    if (pointInPolygon(p, ring)) return true;
+  }
+  return false;
+}
+
+export function pointInNavigableFree(
+  p: LatLng,
+  waterRing: [number, number][],
+  obstacles: ObstacleRings
+): boolean {
+  return pointInPolygon(p, waterRing) && !pointInAnyObstacle(p, obstacles);
+}
+
+export function segmentInNavigableFree(
+  a: LatLng,
+  b: LatLng,
+  waterRing: [number, number][],
+  obstacles: ObstacleRings
+): boolean {
+  if (!segmentInPolygon(a, b, waterRing)) return false;
+  if (obstacles.length === 0) return true;
+  const d = haversineM(a, b);
+  const steps = Math.min(
+    SEG_STEPS_MAX,
+    Math.max(SEG_STEPS_MIN, Math.ceil(d / SEG_SAMPLE_METERS))
+  );
+  for (let s = 0; s <= steps; s++) {
+    const p = greatCircleInterpolate(a, b, s / steps);
+    if (pointInAnyObstacle(p, obstacles)) return false;
+  }
+  return true;
+}
+
+export function clampPointTowardPreviousFree(
+  p: LatLng,
+  prev: LatLng,
+  waterRing: [number, number][],
+  obstacles: ObstacleRings
+): LatLng {
+  if (pointInNavigableFree(p, waterRing, obstacles)) return p;
+  let lo = 0;
+  let hi = 1;
+  let best = prev;
+  for (let k = 0; k < 22; k++) {
+    const t = (lo + hi) / 2;
+    const q: LatLng = {
+      lat: prev.lat + t * (p.lat - prev.lat),
+      lng: prev.lng + t * (p.lng - prev.lng),
+    };
+    if (pointInNavigableFree(q, waterRing, obstacles)) {
+      best = q;
+      lo = t;
+    } else {
+      hi = t;
+    }
+  }
+  return best;
+}
+
+/**
+ * Snap into water, then if the point lies in a restricted zone, ease it back toward
+ * `referenceSafe` (e.g. ship position) along a chord until it lies in free navigable water.
+ */
+export function snapLatLngIntoFreeWater(
+  p: LatLng,
+  waterRing: [number, number][],
+  obstacles: ObstacleRings,
+  referenceSafe: LatLng
+): LatLng {
+  let q = snapLatLngIntoWater(p, waterRing);
+  if (obstacles.length === 0 || pointInNavigableFree(q, waterRing, obstacles)) return q;
+  let ref = referenceSafe;
+  if (!pointInNavigableFree(ref, waterRing, obstacles)) {
+    ref = snapLatLngIntoWater(ref, waterRing);
+  }
+  if (!pointInNavigableFree(ref, waterRing, obstacles)) return q;
+  let lo = 0;
+  let hi = 1;
+  let best = ref;
+  for (let k = 0; k < 22; k++) {
+    const t = (lo + hi) / 2;
+    const s: LatLng = {
+      lat: ref.lat + t * (q.lat - ref.lat),
+      lng: ref.lng + t * (q.lng - ref.lng),
+    };
+    if (pointInNavigableFree(s, waterRing, obstacles)) {
+      best = s;
+      lo = t;
+    } else {
+      hi = t;
+    }
+  }
+  return best;
+}
+
 function densifyLegAlongRoute(
   a: LatLng,
   b: LatLng,

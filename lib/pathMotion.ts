@@ -1,10 +1,14 @@
 import { advanceLatLng, greatCircleInterpolate } from "@/lib/kinematics";
 import {
+  clampPointTowardPreviousFree,
   clampPointTowardPreviousInside,
   haversineM,
+  pointInNavigableFree,
   pointInPolygon,
+  segmentInNavigableFree,
   segmentInPolygon,
   type LatLng,
+  type ObstacleRings,
 } from "@/lib/waterRouting";
 
 /** Initial bearing from `from` to `to` (degrees, 0–360, clockwise from north). */
@@ -124,13 +128,19 @@ export function stepAlongPolylineInWater(
   along: number,
   deltaM: number,
   ring: [number, number][],
-  lastInside: LatLng
+  lastInside: LatLng,
+  obstacles: ObstacleRings = []
 ): { along: number; position: LatLng; bearingDeg: number; ended: boolean } {
+  const clampPrev = (q: LatLng, prev: LatLng) =>
+    obstacles.length
+      ? clampPointTowardPreviousFree(q, prev, ring, obstacles)
+      : clampPointTowardPreviousInside(q, prev, ring);
+  const inside = (q: LatLng) =>
+    obstacles.length ? pointInNavigableFree(q, ring, obstacles) : pointInPolygon(q, ring);
+
   if (deltaM <= 1e-9) {
     const cur = stepAlongPolylineLngLat(pathLngLat, along, 0);
-    const position = pointInPolygon(cur.position, ring)
-      ? cur.position
-      : clampPointTowardPreviousInside(cur.position, lastInside, ring);
+    const position = inside(cur.position) ? cur.position : clampPrev(cur.position, lastInside);
     return { ...cur, position };
   }
   const n = Math.max(1, Math.ceil(deltaM / 80));
@@ -145,8 +155,8 @@ export function stepAlongPolylineInWater(
     bearingDeg = step.bearingDeg;
     ended = step.ended;
     let q = step.position;
-    if (!pointInPolygon(q, ring)) {
-      q = clampPointTowardPreviousInside(q, prev, ring);
+    if (!inside(q)) {
+      q = clampPrev(q, prev);
     }
     prev = q;
     if (ended) break;
@@ -164,11 +174,15 @@ function findBestLegalHeadingLeg(
   prev: LatLng,
   dest: LatLng,
   legM: number,
-  ring: [number, number][]
+  ring: [number, number][],
+  obstacles: ObstacleRings
 ): { position: LatLng; bearingDeg: number } | null {
   if (legM <= 1e-9) return null;
   const distToDest = haversineM(prev, dest);
-  if (distToDest <= Math.max(legM * 1.02, 5) && pointInPolygon(dest, ring)) {
+  const destOk = obstacles.length
+    ? pointInNavigableFree(dest, ring, obstacles)
+    : pointInPolygon(dest, ring);
+  if (distToDest <= Math.max(legM * 1.02, 5) && destOk) {
     return {
       position: { lat: dest.lat, lng: dest.lng },
       bearingDeg: initialBearingDeg(prev, dest),
@@ -176,6 +190,11 @@ function findBestLegalHeadingLeg(
   }
   const goalBear = initialBearingDeg(prev, dest);
   let best: { position: LatLng; bearingDeg: number; distAfter: number } | null = null;
+  const segOk = (a: LatLng, b: LatLng) =>
+    obstacles.length ? segmentInNavigableFree(a, b, ring, obstacles) : segmentInPolygon(a, b, ring);
+  const freePoint = (q: LatLng) =>
+    obstacles.length ? pointInNavigableFree(q, ring, obstacles) : pointInPolygon(q, ring);
+
   for (let hdg = 0; hdg < 360; hdg++) {
     const next = advanceLatLng({
       lat: prev.lat,
@@ -184,7 +203,7 @@ function findBestLegalHeadingLeg(
       distanceM: legM,
     });
     const q: LatLng = { lat: next.lat, lng: next.lng };
-    if (!pointInPolygon(q, ring) || !segmentInPolygon(prev, q, ring)) continue;
+    if (!freePoint(q) || !segOk(prev, q)) continue;
     const distAfter = haversineM(q, dest);
     if (
       !best ||
@@ -215,15 +234,22 @@ export function steerTowardPortWithCommitment(
   dest: LatLng,
   travelM: number,
   ring: [number, number][],
-  commit: SteerCommitment
+  commit: SteerCommitment,
+  obstacles: ObstacleRings = []
 ): { position: LatLng; bearingDeg: number; arrived: boolean } {
+  const segOk = (a: LatLng, b: LatLng) =>
+    obstacles.length ? segmentInNavigableFree(a, b, ring, obstacles) : segmentInPolygon(a, b, ring);
+  const destReachable = obstacles.length
+    ? pointInNavigableFree(dest, ring, obstacles)
+    : pointInPolygon(dest, ring);
+
   if (travelM <= 1e-9) {
     const h = commit.committedBearingDeg ?? initialBearingDeg(prev, dest);
     return { position: { ...prev }, bearingDeg: h, arrived: false };
   }
 
   const dist0 = haversineM(prev, dest);
-  if (dist0 <= Math.max(travelM * 1.02, 5) && pointInPolygon(dest, ring)) {
+  if (dist0 <= Math.max(travelM * 1.02, 5) && destReachable) {
     commit.committedBearingDeg = null;
     return {
       position: { lat: dest.lat, lng: dest.lng },
@@ -248,11 +274,9 @@ export function steerTowardPortWithCommitment(
         distanceM: leg,
       });
       const q: LatLng = { lat: next.lat, lng: next.lng };
-      if (pointInPolygon(q, ring) && segmentInPolygon(cur, q, ring)) {
-        if (
-          haversineM(q, dest) <= Math.max(leg * 1.02, 5) &&
-          pointInPolygon(dest, ring)
-        ) {
+      const qFree = obstacles.length ? pointInNavigableFree(q, ring, obstacles) : pointInPolygon(q, ring);
+      if (qFree && segOk(cur, q)) {
+        if (haversineM(q, dest) <= Math.max(leg * 1.02, 5) && destReachable) {
           commit.committedBearingDeg = null;
           return {
             position: { lat: dest.lat, lng: dest.lng },
@@ -268,16 +292,13 @@ export function steerTowardPortWithCommitment(
       commit.committedBearingDeg = null;
     }
 
-    const found = findBestLegalHeadingLeg(cur, dest, leg, ring);
+    const found = findBestLegalHeadingLeg(cur, dest, leg, ring, obstacles);
     if (!found) {
       break;
     }
     commit.committedBearingDeg = found.bearingDeg;
     displayBearing = found.bearingDeg;
-    if (
-      haversineM(found.position, dest) <= Math.max(leg * 1.02, 5) &&
-      pointInPolygon(dest, ring)
-    ) {
+    if (haversineM(found.position, dest) <= Math.max(leg * 1.02, 5) && destReachable) {
       commit.committedBearingDeg = null;
       return {
         position: { lat: dest.lat, lng: dest.lng },
@@ -297,8 +318,11 @@ export function steerPreviewLngLat(
   from: LatLng,
   bearingDeg: number,
   dest: LatLng,
-  ring: [number, number][]
+  ring: [number, number][],
+  obstacles: ObstacleRings = []
 ): [number, number][] {
+  const segOk = (a: LatLng, b: LatLng) =>
+    obstacles.length ? segmentInNavigableFree(a, b, ring, obstacles) : segmentInPolygon(a, b, ring);
   const cap = Math.min(55_000, haversineM(from, dest) * 0.45 + 4000);
   for (let leg = cap; leg >= 600; leg *= 0.55) {
     const tip = advanceLatLng({
@@ -308,7 +332,7 @@ export function steerPreviewLngLat(
       distanceM: leg,
     });
     const q: LatLng = { lat: tip.lat, lng: tip.lng };
-    if (segmentInPolygon(from, q, ring)) {
+    if (segOk(from, q)) {
       return [
         [from.lng, from.lat],
         [q.lng, q.lat],
@@ -332,7 +356,8 @@ export function deadReckoningInWater(
   prev: LatLng,
   headingDeg: number,
   distanceM: number,
-  ring: [number, number][]
+  ring: [number, number][],
+  obstacles: ObstacleRings = []
 ): LatLng {
   if (distanceM <= 1e-9) return prev;
   const n = Math.max(1, Math.ceil(distanceM / 70));
@@ -345,12 +370,12 @@ export function deadReckoningInWater(
       headingDeg,
       distanceM: stepM,
     });
-    if (!pointInPolygon(next, ring)) {
-      next = clampPointTowardPreviousInside(
-        { lat: next.lat, lng: next.lng },
-        cur,
-        ring
-      );
+    const q: LatLng = { lat: next.lat, lng: next.lng };
+    const ok = obstacles.length ? pointInNavigableFree(q, ring, obstacles) : pointInPolygon(q, ring);
+    if (!ok) {
+      next = obstacles.length
+        ? clampPointTowardPreviousFree(q, cur, ring, obstacles)
+        : clampPointTowardPreviousInside(q, cur, ring);
     }
     cur = { lat: next.lat, lng: next.lng };
   }

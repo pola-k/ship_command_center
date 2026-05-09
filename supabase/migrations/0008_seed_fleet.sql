@@ -65,7 +65,7 @@ values
   ('BAH-1', 'Manama',       ST_SetSRID(ST_MakePoint(50.55, 26.50), 4326)::geography),
   ('DOH-1', 'Doha',         ST_SetSRID(ST_MakePoint(51.95, 25.46), 4326)::geography),
   ('AUH-1', 'Abu Dhabi',    ST_SetSRID(ST_MakePoint(54.18, 25.22), 4326)::geography),
-  ('DXB-1', 'Jebel Ali',    ST_SetSRID(ST_MakePoint(55.08, 24.88), 4326)::geography),
+  ('DXB-1', 'Jebel Ali',    ST_SetSRID(ST_MakePoint(54.75, 25.50), 4326)::geography),
   ('BND-1', 'Bandar Abbas', ST_SetSRID(ST_MakePoint(56.11, 26.62), 4326)::geography),
   ('SOH-1', 'Sohar',        ST_SetSRID(ST_MakePoint(56.73, 24.34), 4326)::geography),
   ('MCT-1', 'Muscat',       ST_SetSRID(ST_MakePoint(58.58, 23.92), 4326)::geography)

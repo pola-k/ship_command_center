@@ -41,7 +41,7 @@ export function ThreatSidebar({
             <div className="flex items-center gap-2">
               <span className="inline-flex items-center gap-2 rounded-full bg-cyan-400/10 px-3 py-1 text-xs font-semibold text-cyan-200 ring-1 ring-cyan-300/20">
                 <BrainCircuit className="h-4 w-4" />
-                AI Threat Intelligence
+                Threats
               </span>
               <span className="inline-flex items-center gap-2 rounded-full bg-white/5 px-3 py-1 text-xs text-white/70 ring-1 ring-white/10">
                 <Radar className="h-4 w-4 text-cyan-200/80" />

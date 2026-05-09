@@ -1,14 +1,20 @@
 "use client";
 
+import ThreatPanel from "@/components/ThreatPanel";
 import { useRouter } from "next/navigation";
 import { useEffect, useState } from "react";
-import { resolveUserRole } from "../lib/authRole";
+import { fleetShipsIntel } from "../data/ships";
+import {
+  resolveSessionContext,
+  type SessionContext,
+} from "../lib/authRole";
 import { supabase } from "../lib/supabaseClient";
 import TacticalMap from "./TacticalMap";
 
 export default function CommandPage() {
   const router = useRouter();
   const [loading, setLoading] = useState(true);
+  const [session, setSession] = useState<SessionContext | null>(null);
 
   useEffect(() => {
     let mounted = true;
@@ -18,12 +24,17 @@ export default function CommandPage() {
         router.replace("/login");
         return;
       }
-      const role = await resolveUserRole(supabase, data.user);
-      if (role !== "command") {
-        router.replace("/captain");
+      const ctx = await resolveSessionContext(supabase, data.user);
+      if (!ctx) {
+        router.replace("/choose-role");
+        return;
+      }
+      if (ctx.role === "captain" && !ctx.captainShipId) {
+        router.replace("/choose-role");
         return;
       }
       if (mounted) {
+        setSession(ctx);
         setLoading(false);
       }
     }
@@ -33,6 +44,8 @@ export default function CommandPage() {
     };
   }, [router]);
 
+  const isCaptain = session?.role === "captain";
+
   return (
     <div className="relative min-h-dvh w-screen overflow-hidden bg-[#04131f] text-white">
       {loading ? (
@@ -40,7 +53,23 @@ export default function CommandPage() {
           Loading command dashboard…
         </div>
       ) : null}
-      <TacticalMap />
+      {!loading && session && !isCaptain ? (
+        <ThreatPanel ships={fleetShipsIntel} />
+      ) : null}
+      {!loading && session ? (
+        <TacticalMap
+          mode={session.role}
+          captainShipId={
+            session.role === "captain" ? session.captainShipId : null
+          }
+          captainShipName={
+            session.role === "captain" ? session.captainShipName : null
+          }
+          captainDisplayName={
+            session.role === "captain" ? session.displayName : null
+          }
+        />
+      ) : null}
     </div>
   );
 }

@@ -5,7 +5,7 @@ import { useRouter } from "next/navigation";
 import { resolveUserRole } from "../lib/authRole";
 import { supabase } from "../lib/supabaseClient";
 
-/** Captains use the same fleet dashboard as Command; this route keeps old links working. */
+/** Legacy route: captains and command both use the tactical /command view; this keeps old links working. */
 export default function CaptainPage() {
   const router = useRouter();
 
@@ -21,7 +21,7 @@ export default function CaptainPage() {
       const role = await resolveUserRole(supabase, data.user);
       if (!mounted) return;
       if (role === "captain") {
-        router.replace("/command-dashboard");
+        router.replace("/command");
         return;
       }
       router.replace("/command");

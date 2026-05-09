@@ -114,3 +114,143 @@ export function parsePolygon(poly: unknown): number[][][] | null {
   return null;
 }
 
+function wkxToPolygonOrMultiGeom(geom: unknown): GeoJSON.Polygon | GeoJSON.MultiPolygon | null {
+  try {
+    const gj = (geom as { toGeoJSON?: () => GeoJSON.Geometry }).toGeoJSON?.();
+    if (gj?.type === "Polygon") return gj as GeoJSON.Polygon;
+    if (gj?.type === "MultiPolygon") return gj as GeoJSON.MultiPolygon;
+  } catch {
+    /* ignore */
+  }
+  return null;
+}
+
+/** Geography / geometry values from PostgREST → MapLibre Polygon or MultiPolygon coordinates. */
+export function geographyToMapGeometry(
+  poly: unknown
+): GeoJSON.Polygon | GeoJSON.MultiPolygon | null {
+  if (poly == null) return null;
+
+  if (typeof poly === "object" && poly !== null) {
+    const o = poly as Record<string, unknown>;
+    if (o.type === "Buffer" && Array.isArray(o.data)) {
+      try {
+        const geom = wkx.Geometry.parse(Buffer.from(o.data as number[]));
+        return wkxToPolygonOrMultiGeom(geom);
+      } catch {
+        /* ignore */
+      }
+    }
+    if (
+      (o.type === "Polygon" || o.type === "MultiPolygon") &&
+      Array.isArray(o.coordinates)
+    ) {
+      return poly as GeoJSON.Polygon | GeoJSON.MultiPolygon;
+    }
+  }
+
+  if (typeof poly === "string") {
+    let t = poly.trim();
+    if (t.startsWith("{")) {
+      try {
+        return geographyToMapGeometry(JSON.parse(t) as unknown);
+      } catch {
+        return null;
+      }
+    }
+    if (t.startsWith("\\x")) t = t.slice(2);
+    if (/^(SRID=\d+;)?(POLYGON|MULTIPOLYGON)\b/i.test(t)) {
+      try {
+        const geom = wkx.Geometry.parse(t);
+        return wkxToPolygonOrMultiGeom(geom);
+      } catch {
+        /* ignore */
+      }
+    }
+    const hexLike = /^[0-9a-fA-F]+$/.test(t) && t.length > 40;
+    if (hexLike) {
+      try {
+        const geom = wkx.Geometry.parse(Buffer.from(t, "hex"));
+        return wkxToPolygonOrMultiGeom(geom);
+      } catch {
+        /* ignore */
+      }
+    }
+  }
+
+  const rings = parsePolygon(poly);
+  if (rings?.length) {
+    return { type: "Polygon", coordinates: rings };
+  }
+  return null;
+}
+
+/** Parse PostGIS geography / EWKT LineString-ish payloads into lng-lat vertices. */
+export function parseLineString(line: unknown): [number, number][] | null {
+  if (!line) return null;
+
+  const tryWkxLine = (buf: Buffer): [number, number][] | null => {
+    try {
+      const geom: any = wkx.Geometry.parse(buf);
+      if (
+        geom?.constructor?.name === "LineString" &&
+        Array.isArray(geom.points) &&
+        geom.points.length > 1
+      ) {
+        const coords: [number, number][] = geom.points.map((pt: any) => [Number(pt.x), Number(pt.y)]);
+        if (coords.every(([a, b]) => Number.isFinite(a) && Number.isFinite(b))) return coords;
+      }
+    } catch {
+      /* ignore */
+    }
+    return null;
+  };
+
+  if (typeof line === "object") {
+    const anyLine: any = line;
+    if (anyLine.type === "Buffer" && Array.isArray(anyLine.data)) {
+      const p = tryWkxLine(Buffer.from(anyLine.data));
+      if (p) return p;
+    }
+    if (anyLine.type === "LineString" && Array.isArray(anyLine.coordinates)) {
+      const coords = anyLine.coordinates as unknown[];
+      const out: [number, number][] = [];
+      for (const xy of coords) {
+        if (Array.isArray(xy) && xy.length >= 2) {
+          const lng = Number(xy[0]);
+          const lat = Number(xy[1]);
+          if (Number.isFinite(lng) && Number.isFinite(lat)) out.push([lng, lat]);
+        }
+      }
+      return out.length > 1 ? out : null;
+    }
+  }
+
+  const s = typeof line === "string" ? line : (line as any)?.toString?.();
+  if (typeof s === "string") {
+    const s2 = s.startsWith("\\x") ? s.slice(2) : s;
+
+    const ewkt = s2.match(/SRID=\d+;LINESTRING\((.+)\)/i);
+    const m = ewkt ?? s2.match(/^LINESTRING\((.+)\)/i);
+    if (m?.[1]) {
+      const parts = m[1].split(",").map((part) => part.trim());
+      const verts: [number, number][] = [];
+      for (const part of parts) {
+        const seg = part.split(/\s+/);
+        const lng = Number(seg[0]);
+        const lat = Number(seg[1]);
+        if (Number.isFinite(lng) && Number.isFinite(lat)) verts.push([lng, lat]);
+      }
+      return verts.length > 1 ? verts : null;
+    }
+
+    const hexLike = /^[0-9a-fA-F]+$/.test(s2) && s2.length > 20;
+    if (hexLike) {
+      const p = tryWkxLine(Buffer.from(s2, "hex"));
+      if (p) return p;
+    }
+  }
+
+  return null;
+}
+

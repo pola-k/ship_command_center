@@ -12,6 +12,7 @@
   "dependencies": {
     "@radix-ui/react-avatar": "^1.1.11",
     "@supabase/supabase-js": "^2.57.0",
+    "@turf/turf": "^7.3.5",
     "dotenv": "^17.2.2",
     "framer-motion": "^12.38.0",
     "lucide-react": "^0.541.0",

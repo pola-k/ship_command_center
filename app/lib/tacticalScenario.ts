@@ -76,6 +76,38 @@ export const rocks: Array<{ id: string; name: string; position: [number, number]
   { id: "RK-5", name: "Qatar Shoal", position: [25.9, 52.1] },
 ];
 
+/** Rough adverse-weather footprints for overlay (lng-lat GeoJSON rings are [lng,lat][]) */
+export const adverseWeatherZones: Array<{ id: string; name: string; ring: Array<[number, number]> }> = [
+  {
+    id: "WX-1",
+    name: "Cyclonic Shear Corridor",
+    ring: [
+      [52.0, 25.0],
+      [54.5, 24.85],
+      [55.9, 26.0],
+      [54.8, 27.1],
+      [52.3, 26.95],
+      [52.0, 25.0],
+    ],
+  },
+  {
+    id: "WX-2",
+    name: "Gulf Turbulence Pocket",
+    ring: [
+      [49.8, 28.35],
+      [51.65, 28.05],
+      [52.3, 29.05],
+      [50.95, 29.72],
+      [49.55, 29.37],
+      [49.8, 28.35],
+    ],
+  },
+];
+
+export const PORT_BERTH_SLOTS = 5;
+/** Ships within this distance (km) of a port centroid count as berthed/docked */
+export const PORT_DOCK_RADIUS_KM = 12;
+
 export const initialFleet: ShipState[] = [
   { shipId: "MV-1", name: "Aurora", position: [26.55, 56.2], speed: 14, heading: 105, destination: "MCT-1", fuel: 6800, cargo: "crude oil", status: "normal" },
   { shipId: "MV-2", name: "Borealis", position: [25.5, 57.2], speed: 19, heading: 270, destination: "DXB-1", fuel: 5400, cargo: "containers", status: "normal" },

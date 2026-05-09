@@ -3,21 +3,37 @@
 import { AnimatePresence, motion } from "framer-motion";
 import {
   AlertTriangle,
+  Check,
+  Grid3x3,
   Info,
+  Loader2,
   MapPin,
   Navigation,
   ShipWheel,
+  Trash2,
+  Undo2,
   Waves,
   X,
 } from "lucide-react";
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import maplibregl, { GeoJSONSource, LngLatBoundsLike, Map as MlMap } from "maplibre-gl";
 import "maplibre-gl/dist/maplibre-gl.css";
 
 import type { AppRole } from "@/app/lib/authRole";
 import { AO_BOUNDS, NAVIGABLE_WATER_LATLNG } from "@/lib/fleetConfig";
-import { parsePoint } from "@/lib/geo";
+import { geographyToMapGeometry, parseLineString, parsePoint } from "@/lib/geo";
 import { supabase } from "@/lib/supabaseClient";
+import { playTacticalChirp } from "@/lib/tacticalAudio";
+import {
+  cellGeometriesForCommit,
+  getOrComputeClippedCell,
+  hitTestCellKey,
+  navigableLngLatPolygon,
+  selectedCellsToFeatureCollection,
+  type ClippedCellCache,
+  ZONE_GRID_STEP_DEG,
+  type ZoneCellKey,
+} from "@/lib/zoneArchitect";
 
 import { ShipDetailCard, type ShipDetail } from "./ui/ShipDetailCard";
 
@@ -55,10 +71,44 @@ type AlertRow = {
   severity: number;
   created_at: string;
   status: string;
+  ship_id: string | null;
+  type?: string | null;
+};
+
+type RouteRow = {
+  id: string;
+  ship_id: string;
+  created_at: string;
+  path_line: unknown;
+  is_valid: boolean;
+  distance_m: number;
+  fuel_estimate_tons: number;
+  weather_cost_multiplier: number;
+  invalid_reason: string | null;
 };
 
 function clamp(n: number, min: number, max: number) {
   return Math.max(min, Math.min(max, n));
+}
+
+function formatSupabaseLikeError(err: unknown): string {
+  if (err == null) return "Unknown error";
+  if (typeof err === "string") return err;
+  if (err instanceof Error && err.message) return err.message;
+  if (typeof err === "object") {
+    const o = err as Record<string, unknown>;
+    const parts: string[] = [];
+    if (typeof o.message === "string" && o.message) parts.push(o.message);
+    if (typeof o.details === "string" && o.details) parts.push(o.details);
+    if (typeof o.hint === "string" && o.hint) parts.push(o.hint);
+    if (typeof o.code === "string" && o.code) parts.unshift(`[${o.code}]`);
+    if (parts.length) return parts.join(" · ");
+  }
+  try {
+    return JSON.stringify(err);
+  } catch {
+    return String(err);
+  }
 }
 
 function mpsFromKnots(knots: number) {
@@ -182,6 +232,12 @@ export default function TacticalMap({
   const renderPosRef = useRef<Record<string, { lng: number; lat: number }>>({});
   const metaRef = useRef<Record<string, ShipMetaRow>>({});
 
+  const clippedCellCacheRef = useRef<ClippedCellCache>(new Map());
+  const navPolygonRef = useRef(navigableLngLatPolygon());
+  const selectedZoneCellsRef = useRef<Set<ZoneCellKey>>(new Set());
+  const routesRef = useRef<Record<string, RouteRow>>({});
+  const zonePaintActiveRef = useRef(false);
+
   const [ports, setPorts] = useState<PortRow[]>([]);
   const [alerts, setAlerts] = useState<AlertRow[]>([]);
 
@@ -198,8 +254,69 @@ export default function TacticalMap({
 
   const [dataState, setDataState] = useState<"loading" | "ready" | "error">("loading");
   const [detailTick, setDetailTick] = useState(0);
+  const [zoneMode, setZoneMode] = useState(false);
+  const [zoneErase, setZoneErase] = useState(false);
+  const [selectionEpoch, setSelectionEpoch] = useState(0);
+  const [selectionCount, setSelectionCount] = useState(0);
+  const [routesEpoch, setRoutesEpoch] = useState(0);
+  const [zoneCommitBusy, setZoneCommitBusy] = useState(false);
+  const [zoneDeactivateBusyId, setZoneDeactivateBusyId] = useState<string | null>(null);
+  const [zoneToast, setZoneToast] = useState<string | null>(null);
+  const [committedZoneRows, setCommittedZoneRows] = useState<{ id: string; name: string }[]>([]);
 
   const pulsePhaseRef = useRef(0);
+
+  const bumpZoneSelectionPreview = useCallback(() => {
+    setSelectionCount(selectedZoneCellsRef.current.size);
+    setSelectionEpoch((x) => x + 1);
+  }, []);
+
+  const mergeLatestRoutes = useCallback((rows: RouteRow[]) => {
+    const sorted = [...rows].sort(
+      (a, b) => new Date(b.created_at).getTime() - new Date(a.created_at).getTime()
+    );
+    const next: Record<string, RouteRow> = {};
+    for (const row of sorted) {
+      if (!next[row.ship_id]) next[row.ship_id] = row;
+    }
+    routesRef.current = next;
+    setRoutesEpoch((e) => e + 1);
+  }, []);
+
+  const refreshZonesFromDb = useCallback(async () => {
+    const rz = await supabase
+      .from("restricted_zones")
+      .select("id,name,is_active,polygon")
+      .eq("is_active", true);
+    if (rz.error) return;
+    const rows = (rz.data ?? []) as Array<{ id: string; name: string; polygon: unknown }>;
+    setCommittedZoneRows(rows.map((row) => ({ id: row.id, name: row.name })));
+
+    const feats: GeoJSON.Feature<GeoJSON.Polygon | GeoJSON.MultiPolygon>[] = [];
+    for (const row of rows) {
+      const geometry = geographyToMapGeometry(row.polygon);
+      if (!geometry) continue;
+      feats.push({
+        type: "Feature",
+        properties: { id: row.id, name: row.name },
+        geometry,
+      });
+    }
+    const fc: GeoJSON.FeatureCollection = { type: "FeatureCollection", features: feats };
+    const map = mapRef.current;
+    const src = map?.getSource("restricted-zones-active") as GeoJSONSource | undefined;
+    if (src) src.setData(fc);
+  }, []);
+
+  const refreshRoutesFromDb = useCallback(async () => {
+    const rr = await supabase
+      .from("routes")
+      .select("id,ship_id,created_at,path_line,is_valid,distance_m,fuel_estimate_tons,weather_cost_multiplier,invalid_reason")
+      .order("created_at", { ascending: false })
+      .limit(400);
+    if (rr.error) return;
+    mergeLatestRoutes((rr.data ?? []) as RouteRow[]);
+  }, [mergeLatestRoutes]);
 
   const portById = useMemo(() => {
     const m = new Map<string, PortRow>();
@@ -228,6 +345,10 @@ export default function TacticalMap({
     const destId = meta?.destination_port_id ?? null;
     const destPort = destId ? portById.get(destId) : undefined;
     const destPt = destPort ? parsePoint(destPort.position) : null;
+    const route = routesRef.current[selectedShipId] ?? null;
+    const alertRows = alerts.filter(
+      (a) => a.status === "active" && (a.ship_id ?? null) === selectedShipId
+    );
     return {
       ship_id: selectedShipId,
       name: meta?.name ?? selectedShipId,
@@ -240,8 +361,19 @@ export default function TacticalMap({
       destination_port_name: destPort?.name ?? null,
       destination_lat: destPt?.lat ?? null,
       destination_lng: destPt?.lng ?? null,
+      route_is_valid: route?.is_valid ?? null,
+      route_distance_m: route?.distance_m ?? null,
+      route_fuel_estimate_tons: route?.fuel_estimate_tons ?? null,
+      route_weather_cost_multiplier: route?.weather_cost_multiplier ?? null,
+      route_invalid_reason: route?.invalid_reason ?? null,
+      active_alerts: alertRows.map((a) => ({
+        id: a.id,
+        title: a.title,
+        severity: a.severity,
+        type: a.type ?? null,
+      })),
     };
-  }, [selectedShipId, detailTick, dataState, portById]);
+  }, [selectedShipId, detailTick, dataState, portById, routesEpoch, alerts]);
 
   const ensurePortsLayer = (fc: GeoJSON.FeatureCollection<GeoJSON.Point>) => {
     const map = mapRef.current;
@@ -389,6 +521,33 @@ export default function TacticalMap({
         paint: { "line-color": "#58c7ee", "line-opacity": 0.36, "line-width": 1.5 },
       });
 
+      map.addSource("restricted-preview", {
+        type: "geojson",
+        data: { type: "FeatureCollection", features: [] },
+      });
+      map.addLayer({
+        id: "restricted-preview-fill",
+        type: "fill",
+        source: "restricted-preview",
+        paint: {
+          "fill-color": "#dc2626",
+          "fill-opacity": 0.38,
+          "fill-outline-color": "rgba(255,255,255,0.3)",
+        },
+      });
+      map.addLayer({
+        id: "restricted-preview-line",
+        type: "line",
+        source: "restricted-preview",
+        paint: {
+          "line-color": "#fca5a5",
+          "line-width": 1.75,
+          "line-opacity": 0.92,
+          "line-blur": 0.35,
+          "line-dasharray": [1.25, 1.25],
+        },
+      });
+
       map.addSource("ship-pulse", {
         type: "geojson",
         data: { type: "FeatureCollection", features: [] },
@@ -421,6 +580,34 @@ export default function TacticalMap({
           "line-width": 2,
         },
       });
+
+      map.addSource("restricted-zones-active", {
+        type: "geojson",
+        data: { type: "FeatureCollection", features: [] },
+      });
+      map.addLayer({
+        id: "restricted-zones-fill",
+        type: "fill",
+        source: "restricted-zones-active",
+        paint: {
+          "fill-color": "#dc2626",
+          "fill-opacity": 0.34,
+          "fill-outline-color": "rgba(255,255,255,0.35)",
+        },
+      });
+      map.addLayer({
+        id: "restricted-zones-outline",
+        type: "line",
+        source: "restricted-zones-active",
+        paint: {
+          "line-color": "#fecaca",
+          "line-width": 2,
+          "line-opacity": 0.88,
+          "line-dasharray": [2, 2],
+        },
+      });
+
+      void refreshZonesFromDb();
     });
 
     return () => {
@@ -428,7 +615,7 @@ export default function TacticalMap({
       mapRef.current = null;
       mapLoadedRef.current = false;
     };
-  }, []);
+  }, [refreshZonesFromDb]);
 
   // Initial load: ships meta, ports, ship_state_current, alerts
   useEffect(() => {
@@ -517,15 +704,20 @@ export default function TacticalMap({
         if (!isCaptain) {
           const alertsRes = await supabase
             .from("alerts")
-            .select("id,title,severity,created_at,status")
+            .select("id,title,severity,created_at,status,ship_id,type")
             .eq("status", "active")
             .order("severity", { ascending: false })
             .order("created_at", { ascending: false })
-            .limit(8);
+            .limit(24);
           if (alertsRes.error) throw alertsRes.error;
           if (!cancelled) setAlerts((alertsRes.data ?? []) as AlertRow[]);
         } else if (!cancelled) {
           setAlerts([]);
+        }
+
+        if (!cancelled) {
+          await refreshRoutesFromDb();
+          await refreshZonesFromDb();
         }
 
         if (!cancelled) {
@@ -541,7 +733,7 @@ export default function TacticalMap({
     return () => {
       cancelled = true;
     };
-  }, [isCaptain, captainShipId]);
+  }, [isCaptain, captainShipId, refreshRoutesFromDb, refreshZonesFromDb]);
 
   // Realtime ship updates
   useEffect(() => {
@@ -590,11 +782,11 @@ export default function TacticalMap({
       .on("postgres_changes", { event: "*", schema: "public", table: "alerts" }, async () => {
         const alertsRes = await supabase
           .from("alerts")
-          .select("id,title,severity,created_at,status")
+          .select("id,title,severity,created_at,status,ship_id,type")
           .eq("status", "active")
           .order("severity", { ascending: false })
           .order("created_at", { ascending: false })
-          .limit(8);
+          .limit(24);
         if (!alertsRes.error) setAlerts((alertsRes.data ?? []) as AlertRow[]);
       })
       .subscribe();
@@ -602,6 +794,251 @@ export default function TacticalMap({
       supabase.removeChannel(channel);
     };
   }, [isCaptain]);
+
+  // Realtime overlays: committed zones + route replans for path styling
+  useEffect(() => {
+    const channel = supabase
+      .channel("command_zones_routes_rt")
+      .on("postgres_changes", { event: "*", schema: "public", table: "restricted_zones" }, () => {
+        void refreshZonesFromDb();
+      })
+      .on("postgres_changes", { event: "*", schema: "public", table: "routes" }, () => {
+        void refreshRoutesFromDb();
+      })
+      .subscribe();
+    return () => {
+      supabase.removeChannel(channel);
+    };
+  }, [refreshRoutesFromDb, refreshZonesFromDb]);
+
+  useEffect(() => {
+    const map = mapRef.current;
+    const src = map?.getSource("restricted-preview") as GeoJSONSource | undefined;
+    if (!src) return;
+    const fc = selectedCellsToFeatureCollection(selectedZoneCellsRef.current, clippedCellCacheRef.current);
+    src.setData(fc);
+  }, [selectionEpoch, zoneMode]);
+
+  useEffect(() => {
+    if (!zoneMode) return;
+    let reduce = false;
+    try {
+      reduce = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+    } catch {
+      reduce = false;
+    }
+    if (reduce) return;
+    let t = 0;
+    const id = window.setInterval(() => {
+      t += 1;
+      const map = mapRef.current;
+      if (!map?.getLayer("restricted-preview-line")) return;
+      const wave = 0.38 + (Math.sin(t * 0.12) + 1) * 0.28;
+      try {
+        map.setPaintProperty("restricted-preview-line", "line-opacity", wave);
+        map.setPaintProperty("restricted-preview-fill", "fill-opacity", 0.28 + (Math.sin(t * 0.09) + 1) * 0.1);
+      } catch {
+        /* style not ready */
+      }
+    }, 90);
+    return () => window.clearInterval(id);
+  }, [zoneMode, selectionEpoch]);
+
+  useEffect(() => {
+    const map = mapRef.current;
+    if (!map || !mapLoadedRef.current) return;
+    if (!zoneMode) {
+      map.dragPan.enable();
+      map.getCanvas().style.cursor = "";
+      return;
+    }
+
+    map.dragPan.disable();
+    const canvas = map.getCanvas();
+    canvas.style.cursor = "crosshair";
+
+    const bumpSel = () => {
+      setSelectionCount(selectedZoneCellsRef.current.size);
+      setSelectionEpoch((x) => x + 1);
+    };
+
+    const lngLatFromEvent = (ev: MouseEvent) => {
+      const rect = canvas.getBoundingClientRect();
+      const x = ev.clientX - rect.left;
+      const y = ev.clientY - rect.top;
+      return map.unproject([x, y]);
+    };
+
+    const paintLngLat = (lng: number, lat: number, erase: boolean) => {
+      const key = hitTestCellKey(lng, lat, ZONE_GRID_STEP_DEG);
+      if (!key) return;
+      const sel = selectedZoneCellsRef.current;
+      if (erase) {
+        if (sel.delete(key as ZoneCellKey)) bumpSel();
+      } else {
+        const clipped = getOrComputeClippedCell(
+          clippedCellCacheRef.current,
+          navPolygonRef.current,
+          key as ZoneCellKey,
+          ZONE_GRID_STEP_DEG
+        );
+        if (!clipped) return;
+        if (!sel.has(key as ZoneCellKey)) {
+          sel.add(key as ZoneCellKey);
+          bumpSel();
+        }
+      }
+    };
+
+    const onDown = (ev: MouseEvent) => {
+      if (ev.button !== 0) return;
+      zonePaintActiveRef.current = true;
+      const ll = lngLatFromEvent(ev);
+      const erase = zoneErase || ev.ctrlKey || ev.altKey;
+      paintLngLat(ll.lng, ll.lat, erase);
+    };
+
+    const onMove = (ev: MouseEvent) => {
+      if (!(zonePaintActiveRef.current || ev.buttons === 1)) return;
+      if (ev.buttons !== 1) return;
+      const ll = lngLatFromEvent(ev);
+      const erase = zoneErase || ev.ctrlKey || ev.altKey;
+      paintLngLat(ll.lng, ll.lat, erase);
+    };
+
+    const onUp = () => {
+      zonePaintActiveRef.current = false;
+    };
+
+    canvas.addEventListener("mousedown", onDown);
+    canvas.addEventListener("mousemove", onMove);
+    window.addEventListener("mouseup", onUp);
+
+    return () => {
+      window.removeEventListener("mouseup", onUp);
+      canvas.removeEventListener("mousedown", onDown);
+      canvas.removeEventListener("mousemove", onMove);
+      canvas.style.cursor = "";
+      map.dragPan.enable();
+    };
+  }, [zoneMode, zoneErase]);
+
+  const acknowledgeAlert = useCallback(async (alertId: string) => {
+    const { data } = await supabase.auth.getUser();
+    const user = data.user;
+    if (!user?.id) {
+      setZoneToast("Sign in to acknowledge alerts");
+      window.setTimeout(() => setZoneToast(null), 4000);
+      return;
+    }
+    const ack = await supabase.from("alert_acknowledgements").insert({
+      alert_id: alertId,
+      user_id: user.id,
+      note: "Acknowledged from Command TacticalMap",
+    });
+    if (ack.error) {
+      setZoneToast(formatSupabaseLikeError(ack.error));
+      window.setTimeout(() => setZoneToast(null), 5000);
+      return;
+    }
+    const upd = await supabase.from("alerts").update({ status: "acknowledged" }).eq("id", alertId);
+    if (upd.error) {
+      setZoneToast(formatSupabaseLikeError(upd.error));
+      window.setTimeout(() => setZoneToast(null), 5000);
+      return;
+    }
+    const alertsRes = await supabase
+      .from("alerts")
+      .select("id,title,severity,created_at,status,ship_id,type")
+      .eq("status", "active")
+      .order("severity", { ascending: false })
+      .order("created_at", { ascending: false })
+      .limit(24);
+    if (!alertsRes.error) setAlerts((alertsRes.data ?? []) as AlertRow[]);
+    setDetailTick((t) => t + 1);
+  }, []);
+
+  const commitZoneSelection = useCallback(async () => {
+    if (selectedZoneCellsRef.current.size === 0) return;
+    setZoneCommitBusy(true);
+    setZoneToast(null);
+    try {
+      const geoms = cellGeometriesForCommit(selectedZoneCellsRef.current, clippedCellCacheRef.current);
+      if (geoms.length === 0) {
+        setZoneToast("No navigable cells in selection");
+        return;
+      }
+      const name = `RZ ${new Date().toISOString().slice(11, 19).replace(/:/g, "")}`;
+      const { error } = await supabase.rpc("commit_restricted_zone", {
+        p_name: name,
+        p_cell_polygons: geoms,
+        p_scenario_id: "00000000-0000-0000-0000-000000000001",
+        p_properties: {},
+      });
+      if (error) throw error;
+      playTacticalChirp();
+      selectedZoneCellsRef.current.clear();
+      bumpZoneSelectionPreview();
+      await refreshZonesFromDb();
+      await refreshRoutesFromDb();
+      const alertsRes = await supabase
+        .from("alerts")
+        .select("id,title,severity,created_at,status,ship_id,type")
+        .eq("status", "active")
+        .order("severity", { ascending: false })
+        .order("created_at", { ascending: false })
+        .limit(24);
+      if (!alertsRes.error) setAlerts((alertsRes.data ?? []) as AlertRow[]);
+      setDetailTick((t) => t + 1);
+      setZoneToast("Restricted zone committed");
+      window.setTimeout(() => setZoneToast(null), 3200);
+    } catch (e: unknown) {
+      let msg = formatSupabaseLikeError(e);
+      if (/404|could not find|not\s+found|function .* does not exist/i.test(msg)) {
+        msg +=
+          " Apply migration 0011_commit_restricted_zone.sql (e.g. supabase db reset or supabase db push).";
+      }
+      setZoneToast(msg);
+      window.setTimeout(() => setZoneToast(null), 6000);
+    } finally {
+      setZoneCommitBusy(false);
+    }
+  }, [refreshRoutesFromDb, refreshZonesFromDb, bumpZoneSelectionPreview]);
+
+  const discardZoneSelection = useCallback(() => {
+    selectedZoneCellsRef.current.clear();
+    bumpZoneSelectionPreview();
+  }, [bumpZoneSelectionPreview]);
+
+  const deactivateRestrictedZone = useCallback(
+    async (zoneId: string) => {
+      setZoneDeactivateBusyId(zoneId);
+      setZoneToast(null);
+      try {
+        const { error } = await supabase.from("restricted_zones").update({ is_active: false }).eq("id", zoneId);
+        if (error) throw error;
+        await refreshZonesFromDb();
+        setZoneToast("Zone hidden from map (inactive).");
+        window.setTimeout(() => setZoneToast(null), 3200);
+      } catch (e: unknown) {
+        let msg = formatSupabaseLikeError(e);
+        if (/permission denied|policy|42501|PGRST301/i.test(msg)) {
+          msg +=
+            ' Apply migration 0016_restricted_zones_command_update_policy.sql so Command users may UPDATE is_active.';
+        }
+        setZoneToast(msg);
+        window.setTimeout(() => setZoneToast(null), 8000);
+      } finally {
+        setZoneDeactivateBusyId(null);
+      }
+    },
+    [refreshZonesFromDb]
+  );
+
+  useEffect(() => {
+    if (dataState !== "ready") return;
+    void refreshZonesFromDb();
+  }, [dataState, refreshZonesFromDb]);
 
   // RAF smoothing + marker management + distress pulse
   useEffect(() => {
@@ -710,25 +1147,50 @@ export default function TacticalMap({
           const destPort = destId ? portById.get(destId) : undefined;
           const destPos = destPort ? parsePoint(destPort.position) : null;
           const shipPos = renderPosRef.current[selectedShipId];
-          if (shipPos && destPos) {
+
+          let coords: [number, number][] | null = null;
+          const rr = routesRef.current[selectedShipId];
+          if (rr?.path_line) {
+            coords = parseLineString(rr.path_line);
+          }
+          const invalid = !!(rr && rr.is_valid === false);
+
+          const lineGeom =
+            coords && coords.length > 1
+              ? coords
+              : shipPos && destPos
+                ? [
+                    [shipPos.lng, shipPos.lat] as [number, number],
+                    [destPos.lng, destPos.lat] as [number, number],
+                  ]
+                : null;
+
+          if (lineGeom) {
             routeSource.setData({
               type: "FeatureCollection",
               features: [
                 {
                   type: "Feature",
                   properties: {},
-                  geometry: {
-                    type: "LineString",
-                    coordinates: [
-                      [shipPos.lng, shipPos.lat],
-                      [destPos.lng, destPos.lat],
-                    ],
-                  },
+                  geometry: { type: "LineString", coordinates: lineGeom },
                 },
               ],
             });
           } else {
             routeSource.setData({ type: "FeatureCollection", features: [] });
+          }
+
+          if (map.getLayer("selected-route-line")) {
+            try {
+              map.setPaintProperty(
+                "selected-route-line",
+                "line-dasharray",
+                invalid ? ([1.6, 1.6] as [number, number]) : ([10, 0.01] as [number, number])
+              );
+              map.setPaintProperty("selected-route-line", "line-color", invalid ? "#fcd34d" : "#93c5fd");
+            } catch {
+              /* layer not styled yet */
+            }
           }
         }
       }
@@ -737,7 +1199,7 @@ export default function TacticalMap({
     };
     raf = requestAnimationFrame(tick);
     return () => cancelAnimationFrame(raf);
-  }, [portById, selectedShipId]);
+  }, [portById, selectedShipId, routesEpoch]);
 
   useEffect(() => {
     const map = mapRef.current;
@@ -775,6 +1237,27 @@ export default function TacticalMap({
       />
 
       <div className="absolute left-4 top-1/2 z-20 -translate-y-1/2 space-y-3">
+        <button
+          type="button"
+          onClick={() => {
+            setZoneMode((prev) => {
+              if (prev) {
+                selectedZoneCellsRef.current.clear();
+                zonePaintActiveRef.current = false;
+                setSelectionCount(0);
+                setSelectionEpoch((e) => e + 1);
+              }
+              return !prev;
+            });
+          }}
+          aria-pressed={zoneMode}
+          aria-label={zoneMode ? "Exit Zone Architect" : "Zone Architect"}
+          className={`btn-glow flex h-11 w-11 cursor-pointer items-center justify-center rounded-full border border-white/20 text-cyan-100 backdrop-blur-md transition hover:bg-slate-800/75 ${
+            zoneMode ? "bg-amber-500/35 ring-2 ring-amber-200/55" : "bg-slate-900/70"
+          }`}
+        >
+          <Grid3x3 size={17} />
+        </button>
         {hudButtons.map((item) => (
           <button
             key={item.key}
@@ -930,6 +1413,7 @@ export default function TacticalMap({
               ship={selectedShipDetail}
               onClose={() => setSelectedShipId(null)}
               showClose={!isCaptain}
+              onAcknowledgeAlert={acknowledgeAlert}
             />
           </motion.aside>
         ) : null}
@@ -994,6 +1478,90 @@ export default function TacticalMap({
           )}
         </p>
       </div>
+
+      <AnimatePresence>
+        {zoneMode ? (
+          <motion.div
+            initial={{ opacity: 0, y: 14 }}
+            animate={{ opacity: 1, y: 0 }}
+            exit={{ opacity: 0, y: 14 }}
+            transition={{ duration: 0.22 }}
+            className="pointer-events-auto absolute bottom-6 left-1/2 z-30 flex max-w-xl -translate-x-1/2 flex-col gap-2 rounded-2xl border border-white/20 bg-slate-950/72 px-4 py-3 text-xs text-white shadow-2xl backdrop-blur-lg"
+          >
+            <div className="flex flex-wrap items-center justify-between gap-2">
+              <p className="font-semibold tracking-wide text-emerald-100/90">
+                Zone Architect — paint navigable grid cells ({selectionCount} selected)
+              </p>
+              <label className="flex cursor-pointer items-center gap-2 text-[10px] text-white/65">
+                <input
+                  type="checkbox"
+                  checked={zoneErase}
+                  onChange={(e) => setZoneErase(e.target.checked)}
+                  className="rounded border-white/30 bg-transparent"
+                />
+                Erase brush (Ctrl/Alt temporarily erases too)
+              </label>
+            </div>
+            {zoneToast ? (
+              <p className="rounded-lg border border-amber-300/35 bg-amber-500/10 px-3 py-1.5 text-amber-100">
+                {zoneToast}
+              </p>
+            ) : null}
+            {committedZoneRows.length > 0 ? (
+              <div className="max-h-32 space-y-1 overflow-auto rounded-xl border border-white/10 bg-black/35 px-2 py-2 text-[11px] text-white/85">
+                <p className="text-[10px] font-semibold uppercase tracking-wide text-white/55">
+                  Committed zones (stay on map)
+                </p>
+                <ul className="space-y-1">
+                  {committedZoneRows.map((z) => (
+                    <li
+                      key={z.id}
+                      className="flex items-center justify-between gap-2 rounded-lg border border-white/10 px-2 py-1"
+                    >
+                      <span className="min-w-0 flex-1 truncate text-white/90">{z.name}</span>
+                      <button
+                        type="button"
+                        disabled={zoneDeactivateBusyId !== null}
+                        onClick={() => void deactivateRestrictedZone(z.id)}
+                        className="inline-flex shrink-0 items-center gap-1 rounded-lg border border-rose-300/35 bg-rose-500/15 px-2 py-0.5 text-[10px] text-rose-100 transition hover:bg-rose-500/28 disabled:pointer-events-none disabled:opacity-40"
+                        title="Hide zone from tactical map"
+                      >
+                        {zoneDeactivateBusyId === z.id ? (
+                          <Loader2 size={12} className="animate-spin" />
+                        ) : (
+                          <Trash2 size={12} />
+                        )}
+                        Hide
+                      </button>
+                    </li>
+                  ))}
+                </ul>
+              </div>
+            ) : null}
+            <div className="flex flex-wrap items-center gap-2">
+              <button
+                type="button"
+                disabled={zoneCommitBusy || selectionCount === 0}
+                onClick={() => void commitZoneSelection()}
+                className="inline-flex items-center gap-2 rounded-xl border border-emerald-300/35 bg-emerald-500/20 px-3 py-1.5 text-[11px] font-semibold text-emerald-50 transition hover:bg-emerald-500/35 disabled:pointer-events-none disabled:opacity-40"
+              >
+                {zoneCommitBusy ? <Loader2 size={13} className="animate-spin" /> : <Check size={13} />}
+                Commit restricted zone
+              </button>
+              <button
+                type="button"
+                onClick={() => discardZoneSelection()}
+                className="inline-flex items-center gap-2 rounded-xl border border-white/15 bg-white/5 px-3 py-1.5 text-[11px] text-white/80 transition hover:bg-white/10"
+              >
+                <Undo2 size={13} /> Discard preview
+              </button>
+              <span className="text-[10px] text-white/50">
+                Coarse grid {ZONE_GRID_STEP_DEG.toFixed(2)}° · masked to AO navigable poly
+              </span>
+            </div>
+          </motion.div>
+        ) : null}
+      </AnimatePresence>
     </div>
   );
 }

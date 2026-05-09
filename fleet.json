@@ -54,7 +54,7 @@
     { "id": "BAH-1", "name": "Manama",        "position": [26.50, 50.55] },
     { "id": "DOH-1", "name": "Doha",          "position": [25.46, 51.95] },
     { "id": "AUH-1", "name": "Abu Dhabi",     "position": [25.22, 54.18] },
-    { "id": "DXB-1", "name": "Jebel Ali",     "position": [24.88, 55.08] },
+    { "id": "DXB-1", "name": "Jebel Ali",     "position": [25.50, 54.75] },
     { "id": "BND-1", "name": "Bandar Abbas",  "position": [26.62, 56.11] },
     { "id": "SOH-1", "name": "Sohar",         "position": [24.34, 56.73] },
     { "id": "MCT-1", "name": "Muscat",        "position": [23.92, 58.58] }

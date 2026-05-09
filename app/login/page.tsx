@@ -29,7 +29,7 @@ export default function LoginPage() {
         router.push("/choose-role");
         return;
       }
-      router.push(role === "captain" ? "/captain" : "/command");
+      router.push("/command");
     } catch (err) {
       setError(err instanceof Error ? err.message : "Login failed.");
     } finally {

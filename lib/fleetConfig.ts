@@ -7,6 +7,8 @@ type FleetJson = {
     captainLowFuelDistressTons?: number;
     captainLowFuelResetHysteresis?: number;
     captainDistressSeverity?: number;
+    /** Tons consumed each map sim step: one client RAF tick while underway, or one server fleet tick. */
+    fuelTonsPerSimStep?: number;
   };
 };
 
@@ -27,4 +29,8 @@ export const CAPTAIN_LOW_FUEL_DISTRESS_TONS =
 /** Multiplier above threshold to clear auto low-fuel latch (avoid flapping). */
 export const CAPTAIN_LOW_FUEL_RESET_HYSTERESIS =
   fleetConfig.operationalRules?.captainLowFuelResetHysteresis ?? 1.15;
+
+/** Fixed tons consumed per sim step (each RAF frame while moving, or each fleet tick). Default 10. */
+export const FUEL_TONS_PER_SIM_STEP =
+  fleetConfig.operationalRules?.fuelTonsPerSimStep ?? 10;
 

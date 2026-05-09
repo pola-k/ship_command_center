@@ -8,7 +8,7 @@ import {
   Info,
   Loader2,
   MapPin,
-  Navigation,
+  Ship,
   ShipWheel,
   Trash2,
   Undo2,
@@ -39,6 +39,7 @@ import {
   AO_BOUNDS,
   CAPTAIN_LOW_FUEL_DISTRESS_TONS,
   CAPTAIN_LOW_FUEL_RESET_HYSTERESIS,
+  FUEL_TONS_PER_SIM_STEP,
   NAVIGABLE_WATER_LATLNG,
 } from "@/lib/fleetConfig";
 import { geographyToMapGeometry, parsePoint } from "@/lib/geo";
@@ -85,6 +86,8 @@ export type TacticalMapProps = {
   captainUserId?: string | null;
   /** Extra controls above Zone Architect (e.g. Threats launcher). */
   leadingRail?: ReactNode;
+  /** Notifies parent (e.g. Threat panel) to reload directive text for NLP scoring. */
+  onCommandDirectiveSent?: () => void;
 };
 
 type ShipMetaRow = {
@@ -324,6 +327,7 @@ export default function TacticalMap({
   commandUserId = null,
   captainUserId = null,
   leadingRail = null,
+  onCommandDirectiveSent,
 }: TacticalMapProps) {
   const isCaptain = mode === "captain" && Boolean(captainShipId);
   const isCommand = mode === "command";
@@ -352,6 +356,7 @@ export default function TacticalMap({
   const steerCommitRef = useRef<Record<string, SteerCommitment>>({});
   const lastRafMsRef = useRef<number | null>(null);
   const lastPosSyncMsRef = useRef(0);
+  const lastFuelUiBumpMsRef = useRef(0);
   const yieldPartnersRef = useRef<Map<string, Set<string>>>(new Map());
   const arbitrationSavedRef = useRef<Map<string, { speed: number; status: string }>>(new Map());
   const lastArbMsRef = useRef(0);
@@ -1349,8 +1354,8 @@ export default function TacticalMap({
 
           const baseTravelM =
             mpsFromKnots(clamp(speedKn, 0, 40)) * dt * SIM_SPEED_MULTIPLIER;
-          const travelM =
-            baseTravelM * pairwiseProximitySpeedFactor(nearestNeighborM(shipId));
+          const proxFactor = pairwiseProximitySpeedFactor(nearestNeighborM(shipId));
+          const travelM = baseTravelM * proxFactor;
 
           if (!isHalted && dataState === "ready") {
             const meta = metaRef.current[shipId];
@@ -1410,22 +1415,53 @@ export default function TacticalMap({
             delete steerCommitRef.current[shipId];
           }
 
+          if (!isHalted && dataState === "ready") {
+            const st0 = fixesRef.current[shipId];
+            if (st0.fuel_tons != null) {
+              const burn = FUEL_TONS_PER_SIM_STEP;
+              const prevFuel = st0.fuel_tons;
+              const nextFuel = Math.max(0, prevFuel - burn);
+              let nextStatus = st0.status;
+              let nextSpeed = st0.speed_knots;
+              if (nextFuel === 0 && prevFuel > 0) {
+                nextStatus = "out_of_fuel";
+                nextSpeed = 0;
+              }
+              fixesRef.current[shipId] = {
+                ...st0,
+                fuel_tons: nextFuel,
+                status: nextStatus,
+                speed_knots: nextSpeed,
+              };
+              if (shipId === selectedShipId && burn > 0) {
+                if (now - lastFuelUiBumpMsRef.current > 450) {
+                  lastFuelUiBumpMsRef.current = now;
+                  setDetailTick((x) => x + 1);
+                }
+              }
+              if (nextStatus === "out_of_fuel" && prevFuel > 0) {
+                setDetailTick((x) => x + 1);
+              }
+            }
+          }
+
+          const curFix = fixesRef.current[shipId];
           if (
-            fix.status === "distressed" ||
-            fix.status === "stranded" ||
-            fix.status === "insufficient_fuel" ||
-            fix.status === "out_of_fuel"
+            curFix.status === "distressed" ||
+            curFix.status === "stranded" ||
+            curFix.status === "insufficient_fuel" ||
+            curFix.status === "out_of_fuel"
           ) {
             distress += 1;
-          } else if (fix.status === "rerouting") warning += 1;
+          } else if (curFix.status === "rerouting") warning += 1;
           else normal += 1;
 
           if (
-            fix.status === "distressed" ||
-            fix.status === "stranded" ||
-            fix.status === "insufficient_fuel" ||
-            fix.status === "out_of_fuel" ||
-            (fix.fuel_tons ?? 999999) < CAPTAIN_LOW_FUEL_DISTRESS_TONS
+            curFix.status === "distressed" ||
+            curFix.status === "stranded" ||
+            curFix.status === "insufficient_fuel" ||
+            curFix.status === "out_of_fuel" ||
+            (curFix.fuel_tons ?? 999999) < CAPTAIN_LOW_FUEL_DISTRESS_TONS
           ) {
             nextDistress.add(shipId);
           }
@@ -1658,17 +1694,24 @@ export default function TacticalMap({
           }
         }
 
-        if (!isCaptain && now - lastPosSyncMsRef.current >= POSITION_SYNC_MS) {
+        if (dataState === "ready" && now - lastPosSyncMsRef.current >= POSITION_SYNC_MS) {
           lastPosSyncMsRef.current = now;
-          for (const shipId of Object.keys(fixesRef.current)) {
+          const syncIds =
+            isCaptain && captainShipId ? [captainShipId] : Object.keys(fixesRef.current);
+          for (const shipId of syncIds) {
             const fix = fixesRef.current[shipId];
-            if (fix.status === "stopped") continue;
+            if (!fix) continue;
             const r = renderPosRef.current[shipId];
             if (!r) continue;
+            const hdg = simHeadingRef.current[shipId] ?? fix.heading_deg;
             void supabase
               .from("ship_state_current")
               .update({
                 position: { type: "Point", coordinates: [r.lng, r.lat] },
+                heading_deg: hdg,
+                fuel_tons: fix.fuel_tons,
+                speed_knots: fix.speed_knots,
+                status: fix.status,
                 ts: new Date().toISOString(),
               })
               .eq("ship_id", shipId);
@@ -2153,6 +2196,7 @@ export default function TacticalMap({
                 instruction,
                 createdBy: commandUserId,
               });
+              onCommandDirectiveSent?.();
             }}
           />
         ) : null}
@@ -2205,7 +2249,7 @@ export default function TacticalMap({
 
       <div className="pointer-events-none absolute left-1/2 top-4 z-10 max-w-[min(96vw,520px)] -translate-x-1/2 rounded-full border border-white/15 bg-slate-900/65 px-4 py-2 text-center text-xs text-white/80 backdrop-blur-md">
         <p className="flex flex-wrap items-center justify-center gap-2">
-          <Navigation size={14} className="shrink-0" />
+          <Ship size={14} className="shrink-0" strokeWidth={2} aria-hidden />
           {isCaptain && captainShipId ? (
             <>
               <span className="font-semibold text-cyan-100">

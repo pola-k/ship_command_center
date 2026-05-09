@@ -58,7 +58,7 @@ export default function CommandPage() {
           <ThreatPanel
             ships={fleetShipsIntel}
             commandUserId={session.userId}
-            renderTacticalMap={(launcher) => (
+            renderTacticalMap={(launcher, { onCommandDirectiveSent }) => (
               <TacticalMap
                 mode="command"
                 captainShipId={null}
@@ -67,6 +67,7 @@ export default function CommandPage() {
                 commandUserId={session.userId}
                 captainUserId={null}
                 leadingRail={launcher}
+                onCommandDirectiveSent={onCommandDirectiveSent}
               />
             )}
           />

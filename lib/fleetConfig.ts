@@ -7,7 +7,7 @@ type FleetJson = {
     captainLowFuelDistressTons?: number;
     captainLowFuelResetHysteresis?: number;
     captainDistressSeverity?: number;
-    /** Tons consumed each map sim step: one client RAF tick while underway, or one server fleet tick. */
+    /** Fuel burn rate in tons per second of sim time (client multiplies by frame `dt`; API tick uses 1s steps). */
     fuelTonsPerSimStep?: number;
   };
 };
@@ -30,7 +30,7 @@ export const CAPTAIN_LOW_FUEL_DISTRESS_TONS =
 export const CAPTAIN_LOW_FUEL_RESET_HYSTERESIS =
   fleetConfig.operationalRules?.captainLowFuelResetHysteresis ?? 1.15;
 
-/** Fixed tons consumed per sim step (each RAF frame while moving, or each fleet tick). Default 10. */
+/** Tons per second while underway (`FUEL_TONS_PER_SIM_STEP * dt` per animation frame). Default tuned for visible transit without instant empty tanks. */
 export const FUEL_TONS_PER_SIM_STEP =
-  fleetConfig.operationalRules?.fuelTonsPerSimStep ?? 10;
+  fleetConfig.operationalRules?.fuelTonsPerSimStep ?? 0.35;
 

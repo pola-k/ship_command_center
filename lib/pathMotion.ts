@@ -166,6 +166,9 @@ export function stepAlongPolylineInWater(
 
 const STEER_CHUNK_M = 380;
 
+/** Snap-to-port when within this distance of the navigation goal (snapped berth); avoids ships hovering offshore while UI expects “arrived”. */
+const PORT_ARRIVAL_RADIUS_M = 1100;
+
 /**
  * Among all integer headings, pick the leg of length `legM` that ends in water and minimizes
  * distance to `dest` (tie-break: closer to great-circle bearing to `dest`).
@@ -182,7 +185,7 @@ function findBestLegalHeadingLeg(
   const destOk = obstacles.length
     ? pointInNavigableFree(dest, ring, obstacles)
     : pointInPolygon(dest, ring);
-  if (distToDest <= Math.max(legM * 1.02, 5) && destOk) {
+  if (distToDest <= Math.max(legM * 1.02, PORT_ARRIVAL_RADIUS_M) && destOk) {
     return {
       position: { lat: dest.lat, lng: dest.lng },
       bearingDeg: initialBearingDeg(prev, dest),
@@ -276,7 +279,7 @@ export function steerTowardPortWithCommitment(
       const q: LatLng = { lat: next.lat, lng: next.lng };
       const qFree = obstacles.length ? pointInNavigableFree(q, ring, obstacles) : pointInPolygon(q, ring);
       if (qFree && segOk(cur, q)) {
-        if (haversineM(q, dest) <= Math.max(leg * 1.02, 5) && destReachable) {
+        if (haversineM(q, dest) <= Math.max(leg * 1.02, PORT_ARRIVAL_RADIUS_M) && destReachable) {
           commit.committedBearingDeg = null;
           return {
             position: { lat: dest.lat, lng: dest.lng },
@@ -298,7 +301,7 @@ export function steerTowardPortWithCommitment(
     }
     commit.committedBearingDeg = found.bearingDeg;
     displayBearing = found.bearingDeg;
-    if (haversineM(found.position, dest) <= Math.max(leg * 1.02, 5) && destReachable) {
+    if (haversineM(found.position, dest) <= Math.max(leg * 1.02, PORT_ARRIVAL_RADIUS_M) && destReachable) {
       commit.committedBearingDeg = null;
       return {
         position: { lat: dest.lat, lng: dest.lng },

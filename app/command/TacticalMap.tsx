@@ -186,14 +186,14 @@ type ShipFix = {
 };
 
 function shipTone(status: string, speedKnots: number) {
-  if (status === "distressed") return { fill: "#b91c1c", stroke: "rgba(255,255,255,0.9)" };
+  if (status === "distressed") return { fill: "#dc2626", stroke: "rgba(255,255,255,0.9)" };
   if (status === "insufficient_fuel" || status === "out_of_fuel")
     return { fill: "#ea580c", stroke: "rgba(255,255,255,0.88)" };
-  if (status === "stranded") return { fill: "#7f1d1d", stroke: "rgba(255,255,255,0.85)" };
+  if (status === "stranded") return { fill: "#991b1b", stroke: "rgba(255,255,255,0.85)" };
   if (status === "rerouting") return { fill: "#f59e0b", stroke: "rgba(255,255,255,0.88)" };
   if (status === "stopped") return { fill: "#64748b", stroke: "rgba(255,255,255,0.6)" };
-  if (speedKnots >= 15) return { fill: "#f43f5e", stroke: "rgba(255,255,255,0.9)" };
-  return { fill: "#e11d48", stroke: "rgba(255,255,255,0.88)" };
+  if (speedKnots >= 15) return { fill: "#22c55e", stroke: "rgba(255,255,255,0.82)" };
+  return { fill: "#38bdf8", stroke: "rgba(255,255,255,0.78)" };
 }
 
 /** Side-profile ship (bow up = north); white details like a bridge chart symbol. */
@@ -298,7 +298,7 @@ const PROXIMITY_ARB_ENABLED = process.env.NEXT_PUBLIC_ENABLE_PROXIMITY_ARB === "
 const POSITION_SYNC_MS = 800;
 const SIM_SPEED_MULTIPLIER = Math.max(
   1,
-  Number.parseFloat(process.env.NEXT_PUBLIC_SIM_SPEED_MULT ?? "5000") || 5000
+  Number.parseFloat(process.env.NEXT_PUBLIC_SIM_SPEED_MULT ?? "225") || 225
 );
 
 const PAIRWISE_SLOW_CLOSE_M = 700;
@@ -397,6 +397,8 @@ export default function TacticalMap({
   const [committedZoneRows, setCommittedZoneRows] = useState<{ id: string; name: string }[]>([]);
   const [captainDistressDraft, setCaptainDistressDraft] = useState("");
   const [captainDistressBusy, setCaptainDistressBusy] = useState(false);
+  /** When captain taps Close on the vessel sidebar, hide it until they select the ship again. */
+  const [captainSidebarDismissed, setCaptainSidebarDismissed] = useState(false);
 
   const pulsePhaseRef = useRef(0);
 
@@ -521,6 +523,22 @@ export default function TacticalMap({
       })),
     };
   }, [selectedShipId, detailTick, dataState, portById, routesEpoch, alerts]);
+
+  useEffect(() => {
+    if (isCaptain && selectedShipId) setCaptainSidebarDismissed(false);
+  }, [isCaptain, selectedShipId]);
+
+  const closeShipSidebar = useCallback(() => {
+    setSelectedShipId(null);
+    if (isCaptain) setCaptainSidebarDismissed(true);
+  }, [isCaptain]);
+
+  const showShipAside =
+    (!isCaptain && selectedShipDetail !== null) ||
+    (isCaptain &&
+      Boolean(captainShipId) &&
+      !captainSidebarDismissed &&
+      (!!selectedShipDetail || selectedShipId === captainShipId));
 
   const ensurePortsLayer = (fc: GeoJSON.FeatureCollection<GeoJSON.Point>) => {
     const map = mapRef.current;
@@ -1418,7 +1436,8 @@ export default function TacticalMap({
           if (!isHalted && dataState === "ready") {
             const st0 = fixesRef.current[shipId];
             if (st0.fuel_tons != null) {
-              const burn = FUEL_TONS_PER_SIM_STEP;
+              /** Scale by frame dt so fuel matches sim time (fleet.json = tons per second at nominal speed). */
+              const burn = FUEL_TONS_PER_SIM_STEP * dt;
               const prevFuel = st0.fuel_tons;
               const nextFuel = Math.max(0, prevFuel - burn);
               let nextStatus = st0.status;
@@ -1456,12 +1475,13 @@ export default function TacticalMap({
           } else if (curFix.status === "rerouting") warning += 1;
           else normal += 1;
 
+          // Pulse ring only for non-normal alert statuses — not low fuel while DB status is still "normal"
+          // (low fuel alone made every vessel look distressed).
           if (
             curFix.status === "distressed" ||
             curFix.status === "stranded" ||
             curFix.status === "insufficient_fuel" ||
-            curFix.status === "out_of_fuel" ||
-            (curFix.fuel_tons ?? 999999) < CAPTAIN_LOW_FUEL_DISTRESS_TONS
+            curFix.status === "out_of_fuel"
           ) {
             nextDistress.add(shipId);
           }
@@ -2084,7 +2104,7 @@ export default function TacticalMap({
       </AnimatePresence>
 
       <AnimatePresence>
-        {selectedShipDetail || (isCaptain && captainShipId) ? (
+        {showShipAside ? (
           <motion.aside
             initial={{ x: 360 }}
             animate={{ x: 0 }}
@@ -2095,8 +2115,8 @@ export default function TacticalMap({
               {selectedShipDetail ? (
                 <ShipDetailCard
                   ship={selectedShipDetail}
-                  onClose={() => setSelectedShipId(null)}
-                  showClose={!isCaptain}
+                  onClose={closeShipSidebar}
+                  showClose
                   onAcknowledgeAlert={isCaptain ? undefined : acknowledgeAlert}
                   commandFooter={
                     isCommand && commandUserId && selectedShipDetail ? (
@@ -2163,7 +2183,15 @@ export default function TacticalMap({
                   }
                 />
               ) : isCaptain ? (
-                <div className="rounded-2xl border border-white/10 bg-slate-900/50 px-4 py-6 text-center text-xs text-white/50">
+                <div className="relative rounded-2xl border border-white/10 bg-slate-900/50 px-4 py-8 text-center text-xs text-white/50">
+                  <button
+                    type="button"
+                    onClick={closeShipSidebar}
+                    className="absolute right-3 top-3 inline-flex h-9 w-9 items-center justify-center rounded-xl border border-white/12 bg-white/5 text-white/70 hover:bg-white/10"
+                    aria-label="Close vessel panel"
+                  >
+                    <X size={16} />
+                  </button>
                   Loading your vessel…
                 </div>
               ) : null}

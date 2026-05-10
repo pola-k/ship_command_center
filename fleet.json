@@ -13,7 +13,7 @@
     "captainLowFuelDistressTons": 2000,
     "captainLowFuelResetHysteresis": 1.15,
     "captainDistressSeverity": 5,
-    "fuelTonsPerSimStep": 10
+    "fuelTonsPerSimStep": 0.35
   },
   "boundingBox": {
     "north": 30.5,

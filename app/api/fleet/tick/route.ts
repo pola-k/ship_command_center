@@ -8,6 +8,12 @@ import { pointInPolygon } from "@/lib/waterRouting";
 
 const RING = NAVIGABLE_WATER_LATLNG as [number, number][];
 
+type RouteBrief = {
+  ship_id: string;
+  is_valid: boolean;
+  fuel_estimate_tons: number;
+};
+
 /**
  * Optional authoritative motion tick. Call from cron with header:
  *   x-fleet-tick-secret: <FLEET_TICK_SECRET>
@@ -36,13 +42,30 @@ export async function POST(req: Request) {
     return NextResponse.json({ error: error.message }, { status: 500 });
   }
 
+  const { data: routeRows } = await supabase
+    .from("routes")
+    .select("ship_id,is_valid,fuel_estimate_tons,created_at")
+    .order("created_at", { ascending: false })
+    .limit(600);
+
+  const routeByShip = new Map<string, RouteBrief>();
+  for (const r of routeRows ?? []) {
+    const sid = r.ship_id as string;
+    if (!routeByShip.has(sid)) {
+      routeByShip.set(sid, {
+        ship_id: sid,
+        is_valid: Boolean(r.is_valid),
+        fuel_estimate_tons: Number(r.fuel_estimate_tons),
+      });
+    }
+  }
+
   let updated = 0;
   for (const row of rows ?? []) {
     if (
       row.status === "stopped" ||
       row.status === "distressed" ||
       row.status === "stranded" ||
-      row.status === "insufficient_fuel" ||
       row.status === "out_of_fuel" ||
       row.status === "arrived"
     ) {
@@ -61,8 +84,30 @@ export async function POST(req: Request) {
       continue;
     }
 
+    const prevFuel = Number(row.fuel_tons);
     const burn = FUEL_TONS_PER_SIM_STEP;
-    const fuel = Math.max(0, Number(row.fuel_tons) - burn);
+    const fuel = Math.max(0, prevFuel - burn);
+
+    let nextStatus = row.status as string;
+    let nextSpeed = Number(row.speed_knots) || 0;
+
+    if (fuel <= 0 && prevFuel > 0) {
+      nextStatus = "out_of_fuel";
+      nextSpeed = 0;
+    } else if (fuel <= 0) {
+      nextStatus = "out_of_fuel";
+      nextSpeed = 0;
+    } else if (nextStatus === "normal" || nextStatus === "insufficient_fuel") {
+      const rt = routeByShip.get(row.ship_id);
+      if (
+        rt?.is_valid === true &&
+        Number.isFinite(rt.fuel_estimate_tons) &&
+        rt.fuel_estimate_tons > 0
+      ) {
+        if (fuel < rt.fuel_estimate_tons) nextStatus = "insufficient_fuel";
+        else nextStatus = "normal";
+      }
+    }
 
     const { error: upErr } = await supabase
       .from("ship_state_current")
@@ -70,6 +115,8 @@ export async function POST(req: Request) {
         position: { type: "Point", coordinates: [next.lng, next.lat] },
         ts: new Date().toISOString(),
         fuel_tons: fuel,
+        speed_knots: nextSpeed,
+        status: nextStatus,
       })
       .eq("ship_id", row.ship_id);
 

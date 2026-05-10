@@ -59,7 +59,7 @@ export function ShipDetailCard({
 }: {
   ship: ShipDetail;
   onClose: () => void;
-  /** Command can dismiss; captain bridge keeps detail pinned. */
+  /** Hide the header close control when embedding elsewhere (map sidebar uses this by default). */
   showClose?: boolean;
   onAcknowledgeAlert?: (alertId: string) => void;
   /** Extra actions for command (e.g. send order to captain). */
